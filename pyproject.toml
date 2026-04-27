@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanomax-control"
+version = "0.1.0"
+description = "Starter project for Thorlabs NanoMax coarse/fine control"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pylablib>=1.4.3",
+  "pyyaml>=6.0",
+  "pythonnet>=3.0.3",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
