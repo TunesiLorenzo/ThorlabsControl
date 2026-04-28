@@ -1,3 +1,0 @@
-pylablib>=1.4.3
-pyyaml>=6.0
-pythonnet>=3.0.3
