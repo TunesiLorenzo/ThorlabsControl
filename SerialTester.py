@@ -10,9 +10,10 @@ from ctypes import (
 KINESIS_DIR = r"C:\Program Files\Thorlabs\Kinesis"
 SERIAL = b"50865380"   # MST602 module serial
 CHANNEL = 1            # use 1 or 2
-REL_MOVE = 100000       # small safe test move in device units
-POLL_MS = 200
-DO_HOME = False     # set True if you want to test homing first
+MOVE_TYPE = 0 # 0 for relative 1 for absolute
+REL_MOVE = 50000      # small safe test move in device units
+POLL_MS = 400
+DO_HOME = True    # set True if you want to test homing first
 
 
 class ThorlabsError(RuntimeError):
@@ -165,10 +166,14 @@ def main():
             wait_until_homed(dll, SERIAL, CHANNEL)
             print("Home complete")
 
-    
-        print(f"Moving by {REL_MOVE} device units...")
-        check_zero(dll.SBC_MoveRelative(SERIAL, CHANNEL, REL_MOVE), "SBC_MoveRelative")
-        wait_until_not_moving(dll, SERIAL, CHANNEL)
+        if MOVE_TYPE:
+            print(f"Moving by {REL_MOVE} device units (ABSOLUTE)...")
+            check_zero(dll.SBC_MoveAbsolute(SERIAL, CHANNEL, REL_MOVE), "SBC_MoveAbsolute")
+            wait_until_not_moving(dll, SERIAL, CHANNEL)
+        else:
+            print(f"Moving by {REL_MOVE} device units...")
+            check_zero(dll.SBC_MoveToPosition(SERIAL, CHANNEL, REL_MOVE), "SBC_MoveToPosition")
+            wait_until_not_moving(dll, SERIAL, CHANNEL)
 
         check_zero(dll.SBC_RequestPosition(SERIAL, CHANNEL), "SBC_RequestPosition")
         check_zero(dll.SBC_RequestStatusBits(SERIAL, CHANNEL), "SBC_RequestStatusBits")
