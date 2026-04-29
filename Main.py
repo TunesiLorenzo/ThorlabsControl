@@ -654,13 +654,8 @@ if __name__ == "__main__":
     SERIAL = "50865380"
     
     # Uncomment to also run movement tests after homing
-    i = 0
-    for i in range(10):
-        x_move(0.5)
-        y_move(0.1)
-        x_move(-0.5)
-        i += 1
-    print(f"Completed iteration {i}")
+    x_move(0.5)
+    y_move(0.5)
     # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
     #     motor.print_state("INITIAL")
     #     motor.print_state("INITIAL",real_unit=True)
