@@ -613,6 +613,32 @@ if __name__ == "__main__":
         motor.move_relative(-x,wait=True,real_unit=True)
         print("Position after relative:", motor.get_position(real_unit=True))
 
+    with ThorlabsModularStepperController(serial=SERIAL, channel=2) as motor:
+        motor.print_state("INITIAL")
+        motor.print_state("INITIAL",real_unit=True)
+
+        motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
+        print("Velocity:", motor.get_velocity_params(real_unit=True))
+        print("Velocity:", motor.get_velocity_params())
+
+        motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
+        print("Velocity:", motor.get_velocity_params(real_unit=True))
+        print("Velocity:", motor.get_velocity_params())
+
+        x = 0.5
+
+        motor.move_relative(x,wait=True,real_unit=True)
+        print("Position after relative:", motor.get_position(real_unit=True))
+
+        motor.move_relative(-x,wait=True,real_unit=True)
+        print("Position after relative:", motor.get_position(real_unit=True))
+
+        motor.move_relative(x,wait=True,real_unit=True)
+        print("Position after relative:", motor.get_position(real_unit=True))
+
+        motor.move_relative(-x,wait=True,real_unit=True)
+        print("Position after relative:", motor.get_position(real_unit=True))
+
         '''
         motor.move_absolute(0,wait=False)
         print("Position after absolute:", motor.get_position())
