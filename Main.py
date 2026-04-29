@@ -364,7 +364,13 @@ class ThorlabsModularStepperController:
         raise TimeoutError("Timed out waiting for motion to stop")
 
     def wait_until_homed(self, timeout_s: float = 120.0):
-        return
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            self.request_update()
+            if self.get_status_bits() & 0x00000400:
+                return
+            time.sleep(0.3)
+        raise TimeoutError("Timed out waiting for homing to complete")
 
     def set_velocity_params(self, acceleration: int, max_velocity: int, real_unit: bool = False):
         if real_unit:            
@@ -583,42 +589,71 @@ class ThorlabsModularStepperController:
 
         return int(conv_value)    
 
-    def x_move(self, x: float):
-        with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
-            motor.print_state("INITIAL")
-            motor.print_state("INITIAL",real_unit=True)
-    
-            motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
-            print("Velocity:", motor.get_velocity_params(real_unit=True))
-            print("Velocity:", motor.get_velocity_params())
-    
-            motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
-            print("Velocity:", motor.get_velocity_params(real_unit=True))
-            print("Velocity:", motor.get_velocity_params())
-    
-            motor.move_relative(x,wait=True,real_unit=True)
-            print("Position after relative:", motor.get_position(real_unit=True))
+@staticmethod
+def x_move(x: float):
+    with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
+        motor.print_state("INITIAL")
+        motor.print_state("INITIAL",real_unit=True)
 
-    def y_move(self, y: float):
-        with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
-            motor.print_state("INITIAL")
-            motor.print_state("INITIAL",real_unit=True)
-    
-            motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
-            print("Velocity:", motor.get_velocity_params(real_unit=True))
-            print("Velocity:", motor.get_velocity_params())
-    
-            motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
-            print("Velocity:", motor.get_velocity_params(real_unit=True))
-            print("Velocity:", motor.get_velocity_params())
-    
-            motor.move_relative(y,wait=True,real_unit=True)
-            print("Position after relative:", motor.get_position(real_unit=True))
+        motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
+        print("Velocity:", motor.get_velocity_params(real_unit=True))
+        print("Velocity:", motor.get_velocity_params())
+
+        motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
+        print("Velocity:", motor.get_velocity_params(real_unit=True))
+        print("Velocity:", motor.get_velocity_params())
+
+        motor.move_relative(x,wait=True,real_unit=True)
+        print("Position after relative:", motor.get_position(real_unit=True))
+
+@staticmethod
+def y_move(y: float):
+    with ThorlabsModularStepperController(serial=SERIAL, channel=2) as motor:
+        motor.print_state("INITIAL")
+        motor.print_state("INITIAL",real_unit=True)
+
+        motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
+        print("Velocity:", motor.get_velocity_params(real_unit=True))
+        print("Velocity:", motor.get_velocity_params())
+
+        motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
+        print("Velocity:", motor.get_velocity_params(real_unit=True))
+        print("Velocity:", motor.get_velocity_params())
+
+        motor.move_relative(y,wait=True,real_unit=True)
+        print("Position after relative:", motor.get_position(real_unit=True))
 
 if __name__ == "__main__":
     SERIAL = "50865380"
-    ThorlabsModularStepperController.x_move(0.5)
-    ThorlabsModularStepperController.y_move(0.5)
+    
+    # Homing cycle for both axes
+    print("=" * 60)
+    print("HOMING CYCLE - Channel 1 (X axis)")
+    print("=" * 60)
+    with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
+        motor.print_state("BEFORE HOMING")
+        print("\nStarting homing procedure...")
+        motor.home(wait=True, timeout_s=120.0)
+        print("Homing complete!")
+        motor.print_state("AFTER HOMING")
+    
+    print("\n" + "=" * 60)
+    print("HOMING CYCLE - Channel 2 (Y axis)")
+    print("=" * 60)
+    with ThorlabsModularStepperController(serial=SERIAL, channel=2) as motor:
+        motor.print_state("BEFORE HOMING")
+        print("\nStarting homing procedure...")
+        motor.home(wait=True, timeout_s=120.0)
+        print("Homing complete!")
+        motor.print_state("AFTER HOMING")
+    
+    print("\n" + "=" * 60)
+    print("HOMING CYCLE COMPLETE")
+    print("=" * 60)
+    
+    # Uncomment to also run movement tests after homing
+    # x_move(0.5)
+    # y_move(0.5)
     # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
     #     motor.print_state("INITIAL")
     #     motor.print_state("INITIAL",real_unit=True)
