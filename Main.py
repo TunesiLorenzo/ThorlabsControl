@@ -632,7 +632,7 @@ def homing_cycle():
     with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
         motor.print_state("BEFORE HOMING")
         print("\nStarting homing procedure...")
-        motor.home(wait=True, timeout_s=20.0)
+        motor.home(wait=True, timeout_s=30.0)
         print("Homing complete!")
         motor.print_state("AFTER HOMING")
     
@@ -642,7 +642,7 @@ def homing_cycle():
     with ThorlabsModularStepperController(serial=SERIAL, channel=2) as motor:
         motor.print_state("BEFORE HOMING")
         print("\nStarting homing procedure...")
-        motor.home(wait=True, timeout_s=20.0)
+        motor.home(wait=True, timeout_s=30.0)
         print("Homing complete!")
         motor.print_state("AFTER HOMING")
     
@@ -652,11 +652,15 @@ def homing_cycle():
 
 if __name__ == "__main__":
     SERIAL = "50865380"
-    homing_cycle()
     
     # Uncomment to also run movement tests after homing
-    x_move(0.5)
-    y_move(0.5)
+    i = 0
+    for i in range(10):
+        x_move(0.5)
+        y_move(0.1)
+        x_move(-0.5)
+        i += 1
+    print(f"Completed iteration {i}")
     # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
     #     motor.print_state("INITIAL")
     #     motor.print_state("INITIAL",real_unit=True)
