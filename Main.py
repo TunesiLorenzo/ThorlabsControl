@@ -583,63 +583,68 @@ class ThorlabsModularStepperController:
 
         return int(conv_value)    
 
+    def x_move(self, x: float):
+        with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
+            motor.print_state("INITIAL")
+            motor.print_state("INITIAL",real_unit=True)
+    
+            motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
+            print("Velocity:", motor.get_velocity_params(real_unit=True))
+            print("Velocity:", motor.get_velocity_params())
+    
+            motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
+            print("Velocity:", motor.get_velocity_params(real_unit=True))
+            print("Velocity:", motor.get_velocity_params())
+    
+            motor.move_relative(x,wait=True,real_unit=True)
+            print("Position after relative:", motor.get_position(real_unit=True))
 
+    def y_move(self, y: float):
+        with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
+            motor.print_state("INITIAL")
+            motor.print_state("INITIAL",real_unit=True)
+    
+            motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
+            print("Velocity:", motor.get_velocity_params(real_unit=True))
+            print("Velocity:", motor.get_velocity_params())
+    
+            motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
+            print("Velocity:", motor.get_velocity_params(real_unit=True))
+            print("Velocity:", motor.get_velocity_params())
+    
+            motor.move_relative(y,wait=True,real_unit=True)
+            print("Position after relative:", motor.get_position(real_unit=True))
 
 if __name__ == "__main__":
     SERIAL = "50865380"
-    with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
-        motor.print_state("INITIAL")
-        motor.print_state("INITIAL",real_unit=True)
+    ThorlabsModularStepperController.x_move(0.5)
+    ThorlabsModularStepperController.y_move(0.5)
+    # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
+    #     motor.print_state("INITIAL")
+    #     motor.print_state("INITIAL",real_unit=True)
 
-        motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
-        print("Velocity:", motor.get_velocity_params(real_unit=True))
-        print("Velocity:", motor.get_velocity_params())
+    #     motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
+    #     print("Velocity:", motor.get_velocity_params(real_unit=True))
+    #     print("Velocity:", motor.get_velocity_params())
 
-        motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
-        print("Velocity:", motor.get_velocity_params(real_unit=True))
-        print("Velocity:", motor.get_velocity_params())
+    #     motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
+    #     print("Velocity:", motor.get_velocity_params(real_unit=True))
+    #     print("Velocity:", motor.get_velocity_params())
 
-        x = 0.5
+    #     x = 0.5
 
-        motor.move_relative(x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
+    #     motor.move_relative(x,wait=True,real_unit=True)
+    #     print("Position after relative:", motor.get_position(real_unit=True))
 
-        motor.move_relative(-x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
+    #     motor.move_relative(-x,wait=True,real_unit=True)
+    #     print("Position after relative:", motor.get_position(real_unit=True))
 
-        motor.move_relative(x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
+    #     motor.move_relative(x,wait=True,real_unit=True)
+    #     print("Position after relative:", motor.get_position(real_unit=True))
 
-        motor.move_relative(-x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
-
-    with ThorlabsModularStepperController(serial=SERIAL, channel=2) as motor:
-        motor.print_state("INITIAL")
-        motor.print_state("INITIAL",real_unit=True)
-
-        motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
-        print("Velocity:", motor.get_velocity_params(real_unit=True))
-        print("Velocity:", motor.get_velocity_params())
-
-        motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
-        print("Velocity:", motor.get_velocity_params(real_unit=True))
-        print("Velocity:", motor.get_velocity_params())
-
-        x = 0.5
-
-        motor.move_relative(x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
-
-        motor.move_relative(-x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
-
-        motor.move_relative(x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
-
-        motor.move_relative(-x,wait=True,real_unit=True)
-        print("Position after relative:", motor.get_position(real_unit=True))
-
-        '''
+    #     motor.move_relative(-x,wait=True,real_unit=True)
+    #     print("Position after relative:", motor.get_position(real_unit=True))
+    '''
         motor.move_absolute(0,wait=False)
         print("Position after absolute:", motor.get_position())
         
@@ -654,4 +659,5 @@ if __name__ == "__main__":
         motor.jog_forward(wait=False)
         print("Position after jog backward:", motor.get_position())
         '''
-        motor.print_state("FINAL")
+    
+      #  motor.print_state("FINAL")
