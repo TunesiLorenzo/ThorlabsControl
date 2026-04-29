@@ -422,7 +422,7 @@ class ThorlabsModularStepperController:
     # ------------------------------------------------------------------
     # Motion
     # ------------------------------------------------------------------
-    def home(self, wait: bool = True, timeout_s: float = 120.0):
+    def home(self, wait: bool = True, timeout_s: float = 20.0):
         if not self.dll.SBC_CanHome(self.serial, self.channel):
             raise ThorlabsError("This channel cannot home")
 
@@ -623,9 +623,8 @@ def y_move(y: float):
         motor.move_relative(y,wait=True,real_unit=True)
         print("Position after relative:", motor.get_position(real_unit=True))
 
-if __name__ == "__main__":
-    SERIAL = "50865380"
-    
+@staticmethod
+def homing_cycle():
     # Homing cycle for both axes
     print("=" * 60)
     print("HOMING CYCLE - Channel 1 (X axis)")
@@ -633,7 +632,7 @@ if __name__ == "__main__":
     with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
         motor.print_state("BEFORE HOMING")
         print("\nStarting homing procedure...")
-        motor.home(wait=True, timeout_s=120.0)
+        motor.home(wait=True, timeout_s=20.0)
         print("Homing complete!")
         motor.print_state("AFTER HOMING")
     
@@ -643,17 +642,21 @@ if __name__ == "__main__":
     with ThorlabsModularStepperController(serial=SERIAL, channel=2) as motor:
         motor.print_state("BEFORE HOMING")
         print("\nStarting homing procedure...")
-        motor.home(wait=True, timeout_s=120.0)
+        motor.home(wait=True, timeout_s=20.0)
         print("Homing complete!")
         motor.print_state("AFTER HOMING")
     
     print("\n" + "=" * 60)
     print("HOMING CYCLE COMPLETE")
     print("=" * 60)
+
+if __name__ == "__main__":
+    SERIAL = "50865380"
+    homing_cycle()
     
     # Uncomment to also run movement tests after homing
-    # x_move(0.5)
-    # y_move(0.5)
+    x_move(0.5)
+    y_move(0.5)
     # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
     #     motor.print_state("INITIAL")
     #     motor.print_state("INITIAL",real_unit=True)
