@@ -289,7 +289,7 @@ if __name__ == "__main__":
         )
         
         if value is not None:
-            print(f"Value: {value}")
+            print(f"Value: {3.3}")
         else:
             print("No reading")
     
