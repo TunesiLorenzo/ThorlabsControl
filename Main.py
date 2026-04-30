@@ -10,7 +10,7 @@ from ctypes import (
     c_bool,
     c_uint32,
 )
-
+import matplotlib.pyplot as plt
 
 KINESIS_DIR = r"C:\Program Files\Thorlabs\Kinesis"
 
@@ -140,6 +140,9 @@ class ThorlabsModularStepperController:
 
         dll.SBC_StopPolling.restype = None
         dll.SBC_StopPolling.argtypes = [c_char_p, c_short]
+
+        dll.SBC_PollingDuration.restype = c_int
+        dll.SBC_PollingDuration.argtypes = [c_char_p, c_short]
 
         # Status / position
         dll.SBC_RequestSettings.restype = c_short
@@ -327,9 +330,38 @@ class ThorlabsModularStepperController:
         else:
             return int(self.dll.SBC_GetPosition(self.serial, self.channel))
 
-    def is_moving(self) -> bool:
+    def is_moving(self, settle_delay_s: float | None = None) -> bool:
+        """
+        Return True if the controller reports motion/homing.
+
+        Notes:
+        - SBC_GetStatusBits() returns the latest cached status received by the DLL.
+        - So we request a fresh update first, then wait at least one polling interval
+        before reading the bits.
+        """
+        check_zero(
+            self.dll.SBC_RequestStatusBits(self.serial, self.channel),
+            "SBC_RequestStatusBits",
+        )
+        check_zero(
+            self.dll.SBC_RequestPosition(self.serial, self.channel),
+            "SBC_RequestPosition",
+        )
+
+        if settle_delay_s is None:
+            settle_delay_s = max(0.01, self.poll_ms / 1000.0)
+
+        time.sleep(settle_delay_s)
+
         status = self.get_status_bits()
-        moving_mask = 0x00000010 | 0x00000020 | 0x00000040 | 0x00000080 | 0x00000200
+
+        moving_mask = (
+            0x00000010 |  # moving CW
+            0x00000020 |  # moving CCW
+            0x00000040 |  # jogging CW
+            0x00000080 |  # jogging CCW
+            0x00000200    # homing
+        )
         return (status & moving_mask) != 0
     
     def get_velocity_params(self, real_unit: bool = False):
@@ -355,13 +387,39 @@ class ThorlabsModularStepperController:
                 "max_velocity": int(max_velocity.value),
             }
 
-    def wait_until_stopped(self, timeout_s: float = 30.0):
+    def wait_until_stopped(
+        self,
+        timeout_s: float = 30.0,
+        poll_interval_s: float | None = None,
+        require_motion_seen: bool = True,
+    ):
+        """
+        Wait until motion has actually finished.
+
+        Why this works better:
+        - A move command can be issued and the first status read may still say
+        'not moving' because the DLL status is cached.
+        - So we optionally wait until motion is seen once, then wait for it to clear.
+        """
+        if poll_interval_s is None:
+            poll_interval_s = max(0.01, self.poll_ms / 1000.0)
+
         deadline = time.time() + timeout_s
+        saw_motion = False
         while time.time() < deadline:
-            if not self.is_moving():
-                return
-            time.sleep(0.3)
-        raise TimeoutError("Timed out waiting for motion to stop")
+            moving = self.is_moving(settle_delay_s=poll_interval_s)
+
+            if moving:
+                saw_motion = True
+            else:
+                if (not require_motion_seen) or saw_motion:
+                    return
+
+            time.sleep(poll_interval_s)
+
+        # raise TimeoutError(
+        #     f"Timed out waiting for motion to stop on channel {self.channel}"
+        # )
 
     def wait_until_homed(self, timeout_s: float = 120.0):
         deadline = time.time() + timeout_s
@@ -445,9 +503,9 @@ class ThorlabsModularStepperController:
         )
 
         if wait:
-            sleep_time =  1.6 * abs(self.unit_device2real(value=displacement,type=0)) / self.get_max_velocity(real_unit=True)
-
-            time.sleep(sleep_time)
+            # sleep_time =  1.6 * abs(self.unit_device2real(value=displacement,type=0)) / self.get_max_velocity(real_unit=True)
+            # time.sleep(sleep_time)
+            self.wait_until_stopped(timeout_s=timeout_s)
 
     def set_absolute_target(self, position: int):
         check_zero(
@@ -588,6 +646,9 @@ class ThorlabsModularStepperController:
             conv_value = value * 9012
 
         return int(conv_value)    
+    
+    def get_polling_duration(self) -> int:
+        return int(self.dll.SBC_PollingDuration(self.serial, self.channel))
 
 @staticmethod
 def x_move(x: float):
@@ -652,10 +713,85 @@ def homing_cycle():
 
 if __name__ == "__main__":
     SERIAL = "50865380"
-    
     # Uncomment to also run movement tests after homing
-    x_move(0.5)
-    y_move(0.5)
+    motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
+    motorx.connect()
+    motory = ThorlabsModularStepperController(serial=SERIAL, channel=2, poll_ms=1)
+    motory.connect()
+
+    motorx.set_velocity_params(acceleration=3, max_velocity=3,real_unit=True)
+    motory.set_velocity_params(acceleration=3, max_velocity=3,real_unit=True)
+    
+
+    # print("Motor X requested poll:", motorx.poll_ms, "ms")
+    # print("Motor X actual poll   :", motorx.get_polling_duration(), "ms")
+
+    # print("Motor Y requested poll:", motory.poll_ms, "ms")
+    # print("Motor Y actual poll   :", motory.get_polling_duration(), "ms")
+
+    # motorx.home()
+    # motory.home()
+    motorx.move_absolute(0,real_unit=True)
+    motory.move_absolute(0,real_unit=True)
+    
+    t1=time.time()
+    motorx.get_position(real_unit=True)
+    t2=time.time()
+    print("Time to get_position ", t2-t1)
+
+    starting_range=1
+    line_spacing=0.015
+    time_delay = 0
+    distance=starting_range
+    xpos=[]
+    ypos=[]
+    while distance>0.02:
+
+        motorx.set_velocity_params(acceleration=2, max_velocity=distance*2,real_unit=True)
+        motory.set_velocity_params(acceleration=2, max_velocity=distance*2,real_unit=True)
+
+
+        motorx.move_relative(distance,wait=True,real_unit=True)
+        #sample logic
+        time.sleep(time_delay)
+        xpos.append(motorx.get_position(real_unit=True))
+        ypos.append(motory.get_position(real_unit=True))
+
+        motory.move_relative(distance,wait=True,real_unit=True)
+        #sample logic
+        time.sleep(time_delay)
+        xpos.append(motorx.get_position(real_unit=True))
+        ypos.append(motory.get_position(real_unit=True))
+
+        distance = distance - line_spacing
+
+        motorx.move_relative(-distance,wait=True,real_unit=True)
+        #sample logic
+        time.sleep(time_delay)
+        xpos.append(motorx.get_position(real_unit=True))
+        ypos.append(motory.get_position(real_unit=True))
+
+        motory.move_relative(-distance,wait=True,real_unit=True)
+        #sample logic
+        time.sleep(time_delay)
+        xpos.append(motorx.get_position(real_unit=True))
+        ypos.append(motory.get_position(real_unit=True))
+
+        distance = distance - line_spacing
+
+
+
+    plt.figure()
+    plt.plot(xpos, ypos, "o-", label="points")  # o = markers, - = connecting line
+    plt.xlabel("x position")
+    plt.ylabel("y position")
+    plt.title("X vs Y positions")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+    # x_move(0.5)
+    # y_move(0.5)
     # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
     #     motor.print_state("INITIAL")
     #     motor.print_state("INITIAL",real_unit=True)
