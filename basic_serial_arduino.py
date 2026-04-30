@@ -1,21 +1,35 @@
 import serial
+import time
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 # this port address is for the serial tx/rx pins on the GPIO header
-SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = 'COM4'
 # be sure to set this to the same rate used on the Arduino
 SERIAL_RATE = 115200
 
 
 def main():
     ser = serial.Serial(SERIAL_PORT, SERIAL_RATE)
+    reading = []
     try:
-        while True:
+        dt=0
+        timemax=10
+        time1 = time.time()
+        while dt<=timemax:
+            time2 = time.time()
+            dt=time2-time1
             # using ser.readline() assumes each line contains a single reading
             # sent using Serial.println() on the Arduino
-            reading = get_reading(ser)
+            reading.append(get_reading(ser))
             # reading is a string...do whatever you want from here
-            print(reading)
+            # print(reading)
+        plt.figure
+        timevec =  np.linspace(0,timemax,len(reading))
+
+        plt.plot(timevec,reading)
+        plt.show()
     except KeyboardInterrupt:
         ser.close()
 
@@ -23,7 +37,7 @@ def main():
 def get_reading(ser=None):
     """Read a single line from the serial port and return it as a string.
 
-    If `ser` is provided it will be reused; otherwise a temporary serial
+    If ser is provided it will be reused; otherwise a temporary serial
     connection is opened and closed for the read.
     Returns None on timeout/empty read.
     """
