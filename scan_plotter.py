@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import importlib
 from typing import Iterable, List, Optional, Sequence, Tuple
+import time
+import serial
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,7 +27,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - required for 3D projecti
 
 from math import ceil
 
-from serial_arduino import read_serial_float
+from basic_serial_arduino import get_reading
 
 Position = Tuple[float, float, float]
 
@@ -40,62 +42,6 @@ def relative_position(position: Sequence[float], origin: Sequence[float]) -> Pos
     px, py, pz = position
     ox, oy, oz = origin
     return float(px) - float(ox), float(py) - float(oy), float(pz) - float(oz)
-
-
-def x_axis_sample_count(
-    x_displacement_mm: float,
-    y_step_mm: float,
-    include_endpoints: bool = True,
-) -> int:
-    """Return how many X-axis sample points are needed for a scan.
-
-    The Y value is treated as the step size between X samples.
-    If include_endpoints is True, the count includes both the start and end points.
-    """
-    if y_step_mm == 0:
-        raise ValueError("y_step_mm must not be zero")
-
-    intervals = ceil(abs(float(x_displacement_mm)) / abs(float(y_step_mm)))
-    return intervals + 1 if include_endpoints else intervals
-
-
-def generate_motor_position_list(
-    x_start_mm: float,
-    y_start_mm: float,
-    x_span_um: float,
-    y_span_um: float,
-    x_step_um: float = 0.5,
-    y_step_um: float = 0.1,
-    serpentine: bool = True,
-):
-    """Generate a trial list of motor positions for a 2D scan.
-
-    The scan is built from micrometer step sizes, then converted to mm.
-    X is the fast axis and Y is the slow axis.
-    """
-    if x_step_um <= 0 or y_step_um <= 0:
-        raise ValueError("x_step_um and y_step_um must be positive")
-
-    x_span_mm = float(x_span_um) / 1000.0
-    y_span_mm = float(y_span_um) / 1000.0
-    x_step_mm = float(x_step_um) / 1000.0
-    y_step_mm = float(y_step_um) / 1000.0
-
-    x_count = x_axis_sample_count(x_span_mm, x_step_mm)
-    y_count = x_axis_sample_count(y_span_mm, y_step_mm)
-
-    positions = []
-    for y_index in range(y_count):
-        y_position_mm = float(y_start_mm) + (y_index * y_step_mm)
-        x_indices = range(x_count)
-        if serpentine and y_index % 2 == 1:
-            x_indices = range(x_count - 1, -1, -1)
-
-        for x_index in x_indices:
-            x_position_mm = float(x_start_mm) + (x_index * x_step_mm)
-            positions.append((x_position_mm, y_position_mm, 0.0))
-
-    return positions
 
 
 @dataclass
@@ -258,16 +204,26 @@ def add_sampled_position(
     The X and Y positions come from your motion code. The Arduino reading becomes
     the plotted value for that position.
     """
-    reading = read_serial_float(
-        port=port,
-        rate=rate,
-        x_displacement_mm=x_displacement_mm,
-        y_step_mm=y_step_mm,
-        sample_delay=sample_delay,
-        include_endpoints=include_endpoints,
-    )
-    plotter.add_point((x_position_mm, y_position_mm, z_position_mm), reading)
-    return reading
+    if sample_delay > 0:
+        time.sleep(sample_delay)
+    
+    # Create a serial connection and read the value
+    ser = serial.Serial(port, rate)
+    try:
+        reading = get_reading(ser)
+        if reading is not None:
+            # Try to convert to float; if it fails, keep as string
+            try:
+                value = float(reading)
+            except (ValueError, TypeError):
+                value = reading
+            plotter.add_point((x_position_mm, y_position_mm, z_position_mm), value)
+            return value
+        else:
+            print(f"Warning: No reading received from {port}")
+            return None
+    finally:
+        ser.close()
 
 
 def add_motor_sample(
@@ -302,12 +258,42 @@ def add_motor_sample(
 
 
 if __name__ == "__main__":
+    import math
     
-    demo = [
-        ((0.0, 0.0, 0.0), 0.2),
-        ((1.0, 0.0, 0.0), 0.5),
-        ((1.0, 1.0, 0.0), 1.0),
-        ((0.0, 1.0, 0.0), 0.7),
-    ]
-    plot_interactive_scan_data(demo, output_path="scan_plot.html", auto_open=True)
-    print("Saved interactive demo plot to scan_plot.html")
+    # Create plotter with origin at center
+    plotter = ScanPlotter(origin=(0, 0, 0))
+    
+    # Generate spiral points
+    num_points = 20
+    max_radius = 50.0  # mm
+    num_turns = 3
+    
+    for i in range(num_points):
+        t = i / num_points * num_turns * 2 * math.pi  # angle parameter
+        r = (i / num_points) * max_radius  # radius increases with each point
+        
+        x = r * math.cos(t)
+        y = r * math.sin(t)
+        z = 0.0
+        
+        print(f"Reading point {i+1}/{num_points} at ({x:.1f}, {y:.1f}, {z:.1f})...", end=" ", flush=True)
+        
+        # Read from actual Arduino and add to plotter
+        value = add_sampled_position(
+            plotter,
+            x, y,
+            x_displacement_mm=0,
+            y_step_mm=0,
+            sample_delay=0.1,
+            z_position_mm=z,
+        )
+        
+        if value is not None:
+            print(f"Value: {value}")
+        else:
+            print("No reading")
+    
+    # Plot the collected data
+    print("\nGenerating plot...")
+    plotter.plot_interactive(output_path="scan_plot.html", auto_open=True, title="Spiral Scan with Arduino Data")
+    print("Saved interactive spiral plot to scan_plot.html")

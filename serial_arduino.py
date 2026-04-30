@@ -10,32 +10,12 @@ SERIAL_PORT = '/dev/ttyUSB0'
 SERIAL_RATE = 115200
 
 
-def x_axis_sample_count(
-    x_displacement_mm: float,
-    y_step_mm: float,
-    include_endpoints: bool = True,
-) -> int:
-    if y_step_mm == 0:
-        raise ValueError("y_step_mm must not be zero")
-
-    intervals = ceil(abs(float(x_displacement_mm)) / abs(float(y_step_mm)))
-    return intervals + 1 if include_endpoints else intervals
-
-
 def read_serial_float(
     port: str = SERIAL_PORT,
     rate: int = SERIAL_RATE,
-    x_displacement_mm: float = 1.0,
-    y_step_mm: float = 1.0,
+    sample_count: int = 1000,
     sample_delay: float = 0.0,
-    include_endpoints: bool = True,
 ):
-    sample_count = x_axis_sample_count(
-        x_displacement_mm=x_displacement_mm,
-        y_step_mm=y_step_mm,
-        include_endpoints=include_endpoints,
-    )
-
     if sample_count < 1:
         raise ValueError("sample_count must be at least 1")
 
@@ -62,15 +42,11 @@ def read_serial_float(
 
 def main():
     while True:
-        x_displacement_mm = 10.0
-        y_step_mm = 0.5
-        sample_count = x_axis_sample_count(x_displacement_mm, y_step_mm)
         reading = read_serial_float(
-            x_displacement_mm=x_displacement_mm,
-            y_step_mm=y_step_mm,
-            sample_delay=0.05,
+            sample_count=1000,
+            sample_delay=0.003,
         )
-        print(f"samples={sample_count}, reading={reading}")
+        print(f"samples=1000, reading={reading}")
 
 
 if __name__ == "__main__":
