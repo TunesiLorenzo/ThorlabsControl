@@ -11,6 +11,8 @@ from ctypes import (
     c_uint32,
 )
 import matplotlib.pyplot as plt
+from ArduinoSampler import close_arduino, open_arduino, burst_read_binary
+import math
 
 KINESIS_DIR = r"C:\Program Files\Thorlabs\Kinesis"
 
@@ -98,6 +100,7 @@ class ThorlabsModularStepperController:
         self._opened = False
         self._enabled = False
         self._polling = False
+        self._actual_poll_ms = None
 
         self._load_dlls()
 
@@ -239,6 +242,7 @@ class ThorlabsModularStepperController:
         if not ok:
             raise ThorlabsError("SBC_StartPolling failed")
         self._polling = True
+        self._actual_poll_ms = self.get_polling_duration()
 
         time.sleep(1.0)
 
@@ -330,6 +334,10 @@ class ThorlabsModularStepperController:
         else:
             return int(self.dll.SBC_GetPosition(self.serial, self.channel))
 
+    def get_status_poll_interval_s(self) -> float:
+        poll_ms = self._actual_poll_ms or self.poll_ms
+        return max(0.01, poll_ms / 1000.0)
+
     def is_moving(self, settle_delay_s: float | None = None) -> bool:
         """
         Return True if the controller reports motion/homing.
@@ -343,13 +351,9 @@ class ThorlabsModularStepperController:
             self.dll.SBC_RequestStatusBits(self.serial, self.channel),
             "SBC_RequestStatusBits",
         )
-        check_zero(
-            self.dll.SBC_RequestPosition(self.serial, self.channel),
-            "SBC_RequestPosition",
-        )
 
         if settle_delay_s is None:
-            settle_delay_s = max(0.01, self.poll_ms / 1000.0)
+            settle_delay_s = self.get_status_poll_interval_s()
 
         time.sleep(settle_delay_s)
 
@@ -392,6 +396,7 @@ class ThorlabsModularStepperController:
         timeout_s: float = 30.0,
         poll_interval_s: float | None = None,
         require_motion_seen: bool = True,
+        motion_start_timeout_s: float = 1.0,
     ):
         """
         Wait until motion has actually finished.
@@ -402,9 +407,11 @@ class ThorlabsModularStepperController:
         - So we optionally wait until motion is seen once, then wait for it to clear.
         """
         if poll_interval_s is None:
-            poll_interval_s = max(0.01, self.poll_ms / 1000.0)
+            poll_interval_s = self.get_status_poll_interval_s()
 
-        deadline = time.time() + timeout_s
+        start = time.time()
+        deadline = start + timeout_s
+        motion_start_deadline = start + motion_start_timeout_s
         saw_motion = False
         while time.time() < deadline:
             moving = self.is_moving(settle_delay_s=poll_interval_s)
@@ -412,14 +419,16 @@ class ThorlabsModularStepperController:
             if moving:
                 saw_motion = True
             else:
-                if (not require_motion_seen) or saw_motion:
+                if (
+                    (not require_motion_seen)
+                    or saw_motion
+                    or time.time() >= motion_start_deadline
+                ):
                     return
 
-            time.sleep(poll_interval_s)
-
-        # raise TimeoutError(
-        #     f"Timed out waiting for motion to stop on channel {self.channel}"
-        # )
+        raise TimeoutError(
+            f"Timed out waiting for motion to stop on channel {self.channel}"
+        )
 
     def wait_until_homed(self, timeout_s: float = 120.0):
         deadline = time.time() + timeout_s
@@ -711,126 +720,453 @@ def homing_cycle():
     print("HOMING CYCLE COMPLETE")
     print("=" * 60)
 
-if __name__ == "__main__":
-    SERIAL = "50865380"
-    # Uncomment to also run movement tests after homing
-    motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
-    motorx.connect()
-    motory = ThorlabsModularStepperController(serial=SERIAL, channel=2, poll_ms=1)
-    motory.connect()
 
-    motorx.set_velocity_params(acceleration=3, max_velocity=3,real_unit=True)
-    motory.set_velocity_params(acceleration=3, max_velocity=3,real_unit=True)
-    
+def build_axis_points(start: float, span: float, spacing: float):
+    if spacing <= 0:
+        raise ValueError("spacing must be positive")
 
-    # print("Motor X requested poll:", motorx.poll_ms, "ms")
-    # print("Motor X actual poll   :", motorx.get_polling_duration(), "ms")
+    start = float(start)
+    span = float(span)
+    total = abs(span)
+    if total == 0:
+        return [start]
 
-    # print("Motor Y requested poll:", motory.poll_ms, "ms")
-    # print("Motor Y actual poll   :", motory.get_polling_duration(), "ms")
+    direction = 1.0 if span >= 0 else -1.0
+    steps = int(math.floor(total / spacing + 1e-9))
+    points = [start + direction * i * spacing for i in range(steps + 1)]
+    end = start + span
 
-    # motorx.home()
-    # motory.home()
-    motorx.move_absolute(0,real_unit=True)
-    motory.move_absolute(0,real_unit=True)
-    
-    t1=time.time()
-    motorx.get_position(real_unit=True)
-    t2=time.time()
-    print("Time to get_position ", t2-t1)
+    if abs(points[-1] - end) > 1e-9:
+        points.append(end)
 
-    starting_range=1
-    line_spacing=0.015
-    time_delay = 0
-    distance=starting_range
-    xpos=[]
-    ypos=[]
-    while distance>0.02:
-
-        motorx.set_velocity_params(acceleration=2, max_velocity=distance*2,real_unit=True)
-        motory.set_velocity_params(acceleration=2, max_velocity=distance*2,real_unit=True)
+    return points
 
 
-        motorx.move_relative(distance,wait=True,real_unit=True)
-        #sample logic
-        time.sleep(time_delay)
-        xpos.append(motorx.get_position(real_unit=True))
-        ypos.append(motory.get_position(real_unit=True))
+def motion_profile(distance: float, max_velocity: float, acceleration: float):
+    distance = abs(float(distance))
+    max_velocity = abs(float(max_velocity))
+    acceleration = abs(float(acceleration))
 
-        motory.move_relative(distance,wait=True,real_unit=True)
-        #sample logic
-        time.sleep(time_delay)
-        xpos.append(motorx.get_position(real_unit=True))
-        ypos.append(motory.get_position(real_unit=True))
+    if distance == 0:
+        return {
+            "distance": 0.0,
+            "ramp_time": 0.0,
+            "cruise_time": 0.0,
+            "ramp_distance": 0.0,
+            "cruise_distance": 0.0,
+            "peak_velocity": 0.0,
+            "total_time": 0.0,
+        }
 
-        distance = distance - line_spacing
+    if max_velocity <= 0:
+        raise ValueError("max_velocity must be positive")
+    if acceleration <= 0:
+        raise ValueError("acceleration must be positive")
 
-        motorx.move_relative(-distance,wait=True,real_unit=True)
-        #sample logic
-        time.sleep(time_delay)
-        xpos.append(motorx.get_position(real_unit=True))
-        ypos.append(motory.get_position(real_unit=True))
+    ramp_time = max_velocity / acceleration
+    ramp_distance = 0.5 * acceleration * ramp_time**2
 
-        motory.move_relative(-distance,wait=True,real_unit=True)
-        #sample logic
-        time.sleep(time_delay)
-        xpos.append(motorx.get_position(real_unit=True))
-        ypos.append(motory.get_position(real_unit=True))
+    if distance >= 2 * ramp_distance:
+        cruise_distance = distance - 2 * ramp_distance
+        cruise_time = cruise_distance / max_velocity
+        peak_velocity = max_velocity
+    else:
+        ramp_time = math.sqrt(distance / acceleration)
+        ramp_distance = distance / 2
+        cruise_distance = 0.0
+        cruise_time = 0.0
+        peak_velocity = acceleration * ramp_time
 
-        distance = distance - line_spacing
+    return {
+        "distance": distance,
+        "ramp_time": ramp_time,
+        "cruise_time": cruise_time,
+        "ramp_distance": ramp_distance,
+        "cruise_distance": cruise_distance,
+        "peak_velocity": peak_velocity,
+        "total_time": 2 * ramp_time + cruise_time,
+    }
 
 
+def expected_move_time(distance: float, max_velocity: float, acceleration: float):
+    return motion_profile(distance, max_velocity, acceleration)["total_time"]
 
-    plt.figure()
-    plt.plot(xpos, ypos, "o-", label="points")  # o = markers, - = connecting line
-    plt.xlabel("x position")
-    plt.ylabel("y position")
-    plt.title("X vs Y positions")
-    plt.grid(True)
-    plt.legend()
+
+def sampling_duration_for_move(
+    distance: float,
+    max_velocity: float,
+    acceleration: float,
+    safety_factor: float = 1.10,
+    overhead_s: float = 0.05,
+):
+    move_time = expected_move_time(distance, max_velocity, acceleration)
+    return move_time * safety_factor + overhead_s
+
+
+def position_after_elapsed(profile, elapsed_s: float):
+    distance = profile["distance"]
+    if distance == 0:
+        return 0.0
+
+    elapsed_s = max(0.0, float(elapsed_s))
+    if elapsed_s >= profile["total_time"]:
+        return distance
+
+    ramp_time = profile["ramp_time"]
+    cruise_time = profile["cruise_time"]
+    acceleration = profile["peak_velocity"] / ramp_time
+
+    if elapsed_s <= ramp_time:
+        return 0.5 * acceleration * elapsed_s**2
+
+    cruise_start_s = ramp_time
+    cruise_end_s = cruise_start_s + cruise_time
+    if elapsed_s <= cruise_end_s:
+        return profile["ramp_distance"] + profile["peak_velocity"] * (
+            elapsed_s - cruise_start_s
+        )
+
+    decel_time = elapsed_s - cruise_end_s
+    return (
+        profile["ramp_distance"]
+        + profile["cruise_distance"]
+        + profile["peak_velocity"] * decel_time
+        - 0.5 * acceleration * decel_time**2
+    )
+
+
+def sample_positions_for_motion(
+    x_start: float,
+    displacement: float,
+    sample_count: int,
+    read_duration_s: float,
+    max_velocity: float,
+    acceleration: float,
+    motion_start_offset_s: float = 0.0,
+):
+    if sample_count <= 0:
+        return []
+
+    profile = motion_profile(displacement, max_velocity, acceleration)
+    direction = 1.0 if displacement >= 0 else -1.0
+
+    if sample_count == 1:
+        elapsed_times = [read_duration_s / 2]
+    else:
+        elapsed_times = [
+            read_duration_s * i / (sample_count - 1) for i in range(sample_count)
+        ]
+
+    return [
+        x_start
+        + direction
+        * position_after_elapsed(profile, elapsed_s - motion_start_offset_s)
+        for elapsed_s in elapsed_times
+    ]
+
+
+def plot_scan(scan_rows):
+    plotted_rows = 0
+    fig, ax = plt.subplots()
+    color_map = plt.get_cmap("viridis")
+    color_count = max(1, len(scan_rows) - 1)
+
+    for row_index, row in enumerate(scan_rows):
+        samples = row["samples"]
+        if not samples:
+            continue
+
+        row_xs = sample_positions_for_motion(
+            x_start=row["x_start"],
+            displacement=row["x_displacement"],
+            sample_count=len(samples),
+            read_duration_s=row.get("sample_span_s", row["read_duration"]),
+            max_velocity=row["max_velocity"],
+            acceleration=row["acceleration"],
+            motion_start_offset_s=row.get("motion_start_offset_s", 0.0),
+        )
+
+        ax.plot(
+            row_xs,
+            samples,
+            linewidth=1.0,
+            color=color_map(row_index / color_count),
+            label=f"y={row['y']:.3f}",
+        )
+        plotted_rows += 1
+
+    if plotted_rows == 0:
+        print("No samples collected; skipping scan plot.")
+        return
+
+    ax.set_xlabel("X position")
+    ax.set_ylabel("ADC count")
+    ax.set_title("Scanned Lines")
+    ax.grid(True)
+
+    if plotted_rows <= 20:
+        ax.legend(title="Row", fontsize="small", ncols=2)
+
+    fig.tight_layout()
     plt.show()
 
-    # x_move(0.5)
-    # y_move(0.5)
-    # with ThorlabsModularStepperController(serial=SERIAL, channel=1) as motor:
-    #     motor.print_state("INITIAL")
-    #     motor.print_state("INITIAL",real_unit=True)
 
-    #     motor.set_velocity_params(acceleration=36048, max_velocity=2000000)
-    #     print("Velocity:", motor.get_velocity_params(real_unit=True))
-    #     print("Velocity:", motor.get_velocity_params())
+def check_connection_and_home(motorx, motory, home_timeout_s: float = 30.0):
+    print("Checking motor connections...")
+    for label, motor in (("X", motorx), ("Y", motory)):
+        motor.request_update()
+        status = motor.get_status_bits()
+        position = motor.get_position(real_unit=True)
+        print(
+            f"{label} connected: "
+            f"status=0x{status:08X}, "
+            f"position={position:.6f}, "
+            f"poll={motor.get_polling_duration()} ms"
+        )
 
-    #     motor.set_velocity_params(acceleration=5, max_velocity=1.5,real_unit=True)
-    #     print("Velocity:", motor.get_velocity_params(real_unit=True))
-    #     print("Velocity:", motor.get_velocity_params())
+    print("Homing motors...")
+    for label, motor in (("X", motorx), ("Y", motory)):
+        print(f"Homing {label} axis...")
+        motor.home(wait=True, timeout_s=home_timeout_s)
+        motor.request_update()
 
-    #     x = 0.5
+        status = motor.get_status_bits()
+        if not status & 0x00000400:
+            raise ThorlabsError(f"{label} axis did not report homed")
 
-    #     motor.move_relative(x,wait=True,real_unit=True)
-    #     print("Position after relative:", motor.get_position(real_unit=True))
+        print(f"{label} homed at position {motor.get_position(real_unit=True):.6f}")
 
-    #     motor.move_relative(-x,wait=True,real_unit=True)
-    #     print("Position after relative:", motor.get_position(real_unit=True))
+    print("Connection and homing check complete.")
 
-    #     motor.move_relative(x,wait=True,real_unit=True)
-    #     print("Position after relative:", motor.get_position(real_unit=True))
 
-    #     motor.move_relative(-x,wait=True,real_unit=True)
-    #     print("Position after relative:", motor.get_position(real_unit=True))
-    '''
-        motor.move_absolute(0,wait=False)
-        print("Position after absolute:", motor.get_position())
-        
-        motor.set_jog_mode(continuous=False, profiled_stop=True)
-        motor.set_jog_step_size(1000000)
-        motor.set_jog_velocity_params(acceleration=36048, max_velocity=120000000)
+def print_scan_timing_stats(scan_rows):
+    if not scan_rows:
+        return
 
-        motor.jog_forward(wait=False)
-        print("Position after jog forward:", motor.get_position())
+    move_to_read_delays = [
+        row["move_to_read_start_s"]
+        for row in scan_rows
+        if "move_to_read_start_s" in row
+    ]
+    command_call_times = [
+        row["move_command_call_s"]
+        for row in scan_rows
+        if "move_command_call_s" in row
+    ]
+    return_to_read_delays = [
+        row["move_return_to_read_start_s"]
+        for row in scan_rows
+        if "move_return_to_read_start_s" in row
+    ]
+    sample_spans = [
+        row["sample_span_s"]
+        for row in scan_rows
+        if "sample_span_s" in row
+    ]
+    motion_start_offsets = [
+        row["motion_start_offset_s"]
+        for row in scan_rows
+        if "motion_start_offset_s" in row
+    ]
 
-        motor.set_jog_velocity_params(acceleration=36048, max_velocity=2000000)
-        motor.jog_forward(wait=False)
-        print("Position after jog backward:", motor.get_position())
-        '''
-    
-      #  motor.print_state("FINAL")
+    def print_stats(label, values):
+        if not values:
+            return
+
+        avg = sum(values) / len(values)
+        print(
+            f"{label}: "
+            f"avg={avg * 1000:.2f} ms, "
+            f"min={min(values) * 1000:.2f} ms, "
+            f"max={max(values) * 1000:.2f} ms"
+        )
+
+    print("Timing summary:")
+    print_stats("Move command issue -> burst read loop start", move_to_read_delays)
+    print_stats("Move command return -> burst read loop start", return_to_read_delays)
+    print_stats("move_relative() call duration", command_call_times)
+    print_stats("Plot compensation offset", motion_start_offsets)
+    print_stats("Buffered sample span used for plotting", sample_spans)
+
+
+
+
+if __name__ == "__main__":
+    SERIAL = "50865380"
+    ARDUINO_PORT = "COM3"
+    ARDUINO_BAUD = 230400
+
+    x0 = 1.0
+    y0 = 1.0
+    x_span = 1.0
+    y_span = 0
+    line_spacing = 0.1
+    default_acceleration = 4.0
+    default_max_velocity = 4.0
+    row_settle_s = 2
+    read_safety_factor = 1.10
+    read_overhead_s = 0.05
+    home_timeout_s = 30.0
+    skip_homing_check = False
+    motion_start_reference = "command_return"
+
+    x_start = x0 - x_span / 2
+    y_start = y0 - y_span / 2
+    y_points = build_axis_points(y_start, y_span, line_spacing)
+    scan_rows = []
+
+    motorx = None
+    motory = None
+    ser = None
+    scan_failed = True
+
+    try:
+        motorx = ThorlabsModularStepperController(
+            serial=SERIAL,
+            channel=1,
+            poll_ms=1,
+        )
+        motory = ThorlabsModularStepperController(
+            serial=SERIAL,
+            channel=2,
+            poll_ms=1,
+        )
+        motorx.connect()
+        motory.connect()
+        if skip_homing_check:
+            print("Skipping motor connection/homing check.")
+        else:
+            check_connection_and_home(
+                motorx=motorx,
+                motory=motory,
+                home_timeout_s=home_timeout_s,
+            )
+
+        motorx.set_velocity_params(
+            acceleration=default_acceleration,
+            max_velocity=default_max_velocity,
+            real_unit=True,
+        )
+        motory.set_velocity_params(
+            acceleration=default_acceleration,
+            max_velocity=default_max_velocity,
+            real_unit=True,
+        )
+
+        motorx.move_absolute(x_start, wait=True, real_unit=True)
+        motory.move_absolute(y_start, wait=True, real_unit=True)
+
+        ser = open_arduino(port=ARDUINO_PORT, baud=ARDUINO_BAUD)
+
+        move_time = expected_move_time(
+            distance=x_span,
+            max_velocity=default_max_velocity,
+            acceleration=default_acceleration,
+        )
+        read_duration = sampling_duration_for_move(
+            distance=x_span,
+            max_velocity=default_max_velocity,
+            acceleration=default_acceleration,
+            safety_factor=read_safety_factor,
+            overhead_s=read_overhead_s,
+        )
+
+        print(
+            f"Scanning {len(y_points)} rows; "
+            f"expected X move time {move_time:.3f}s, "
+            f"read duration {read_duration:.3f}s per row."
+        )
+
+        for row_index, y_target in enumerate(y_points):
+            if row_index > 0:
+                motory.move_absolute(y_target, wait=True, real_unit=True)
+                time.sleep(row_settle_s)
+
+            direction = 1.0 if row_index % 2 == 0 else -1.0
+            x_displacement = direction * x_span
+            actual_x_start = motorx.get_position(real_unit=True)
+            actual_y = motory.get_position(real_unit=True)
+
+            reset_done_s = time.perf_counter()
+            ser.reset_input_buffer()
+            sample_window_start_s = time.perf_counter()
+            move_command_issue_s = time.perf_counter()
+            motorx.move_relative(x_displacement, wait=False, real_unit=True)
+            move_command_return_s = time.perf_counter()
+            samples, read_timing = burst_read_binary(
+                ser=ser,
+                duration=read_duration,
+                reset_buffer=False,
+                return_timing=True,
+            )
+            sample_window_end_s = read_timing["end_time"]
+
+            if motion_start_reference == "command_issue":
+                motion_start_s = move_command_issue_s
+            elif motion_start_reference == "command_return":
+                motion_start_s = move_command_return_s
+            else:
+                raise ValueError(
+                    "motion_start_reference must be 'command_issue' "
+                    "or 'command_return'"
+                )
+
+            motorx.wait_until_stopped(
+                timeout_s=max(read_duration + 2.0, move_time * 2.0 + 2.0),
+                require_motion_seen=False,
+            )
+            actual_x_end = motorx.get_position(real_unit=True)
+
+            scan_rows.append(
+                {
+                    "row": row_index,
+                    "y": actual_y,
+                    "x_start": actual_x_start,
+                    "x_end": actual_x_end,
+                    "x_displacement": x_displacement,
+                    "motion_time": move_time,
+                    "read_duration": read_duration,
+                    "sample_span_s": sample_window_end_s - sample_window_start_s,
+                    "motion_start_offset_s": motion_start_s - sample_window_start_s,
+                    "move_to_read_start_s": (
+                        read_timing["start_time"] - move_command_issue_s
+                    ),
+                    "move_return_to_read_start_s": (
+                        read_timing["start_time"] - move_command_return_s
+                    ),
+                    "move_command_call_s": (
+                        move_command_return_s - move_command_issue_s
+                    ),
+                    "serial_reset_s": sample_window_start_s - reset_done_s,
+                    "acceleration": default_acceleration,
+                    "max_velocity": default_max_velocity,
+                    "samples": samples,
+                }
+            )
+            print(
+                f"Row {row_index + 1}/{len(y_points)}: "
+                f"y={actual_y:.6f}, "
+                f"x={actual_x_start:.6f}->{actual_x_end:.6f}, "
+                f"samples={len(samples)}, "
+                f"cmd->read={scan_rows[-1]['move_to_read_start_s'] * 1000:.2f} ms"
+            )
+
+        print_scan_timing_stats(scan_rows)
+        scan_failed = False
+
+    finally:
+        if ser is not None:
+            close_arduino(ser)
+
+        if scan_failed:
+            if motorx is not None:
+                motorx.safe_shutdown()
+            if motory is not None:
+                motory.safe_shutdown()
+        else:
+            if motorx is not None:
+                motorx.disconnect()
+            if motory is not None:
+                motory.disconnect()
+
+    plot_scan(scan_rows)

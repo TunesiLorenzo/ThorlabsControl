@@ -1,7 +1,7 @@
 const int analogPin = A0;
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(230400);
 
   // ADC prescaler = 32
   ADCSRA = (ADCSRA & 0b11111000) | 0b101;
@@ -10,7 +10,8 @@ void setup() {
 void loop() {
   uint16_t adcValue = analogRead(analogPin);
 
-  float voltage = adcValue;
+  // Convert 10-bit ADC, 0-1023, to 8-bit, 0-255
+  uint8_t sample = adcValue >> 2;
 
-  Serial.println(voltage);  // print voltage with 3 decimal places
+  Serial.write(sample);
 }
