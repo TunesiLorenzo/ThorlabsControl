@@ -1,11 +1,15 @@
-import serial
 import time
-import matplotlib.pyplot as plt
 
-def open_arduino(port="COM3", baud=230400):
+import serial
+
+
+def open_arduino(port="COM3", baud=230400, reset_wait_s=2.0):
+    """Open the Arduino serial port and wait for the board reset."""
     ser = serial.Serial(port, baud, timeout=0)
-    time.sleep(2.0)  # Arduino reset after opening serial
+    if reset_wait_s:
+        time.sleep(reset_wait_s)
     return ser
+
 
 def close_arduino(ser):
     ser.close()
@@ -18,33 +22,42 @@ def burst_read_binary(
     return_timing=False,
     idle_sleep_s=0.0005,
 ):
+    """Read one timed burst from a continuously streaming Arduino.
+
+    reset_buffer=True discards bytes already waiting in the PC-side serial
+    buffer immediately before timing starts. The Arduino firmware still
+    free-runs unless it is changed to a command-triggered protocol.
+    """
     if reset_buffer:
         ser.reset_input_buffer()
 
     raw = bytearray()
     start = time.perf_counter()
+    deadline = start + float(duration)
 
-    while time.perf_counter() - start < duration:
-        n = ser.in_waiting
-        if n:
-            raw.extend(ser.read(n))
-        else:
-            raw.extend(ser.read(1))
-            if idle_sleep_s:
-                time.sleep(idle_sleep_s)
+    while time.perf_counter() < deadline:
+        waiting = ser.in_waiting
+        if waiting:
+            raw.extend(ser.read(waiting))
+        elif idle_sleep_s:
+            time.sleep(idle_sleep_s)
+
     end = time.perf_counter()
-
-    # ArduinoCode.ino sends one 8-bit ADC sample per byte.
     samples = list(raw)
-    if return_timing:
-        return samples, {
-            "start_time": start,
-            "end_time": end,
-            "duration": end - start,
-        }
-    return samples
+
+    if not return_timing:
+        return samples
+
+    return samples, {
+        "start_time": start,
+        "end_time": end,
+        "duration": end - start,
+    }
+
 
 def plot(samples):
+    import matplotlib.pyplot as plt
+
     plt.figure()
     plt.plot(samples)
     plt.title("ADC Binary Burst")
@@ -55,14 +68,13 @@ def plot(samples):
 
 if __name__ == "__main__":
     ser = open_arduino(port="COM3", baud=230400)
-    samples = burst_read_binary(ser=ser, duration=0.1)
-    plot(samples)
-    print(len(samples), "samples")
+    try:
+        samples = burst_read_binary(ser=ser, duration=0.1)
+        print(len(samples), "samples")
+        plot(samples)
 
-    # samples = burst_read_binary(ser=ser, duration=2)
-    # plot(samples)
-    # print(len(samples), "samples")
+        import matplotlib.pyplot as plt
 
-    close_arduino(ser)
-
-    plt.show()
+        plt.show()
+    finally:
+        close_arduino(ser)
