@@ -1,10 +1,10 @@
 """
 Shared motion-timing code: the trapezoidal motion-profile / calibration
-projection math (previously split between Main.py and calibrate_line.py), and
-the get_position()-based move-start-lag measurement machinery (previously in
-measure_move_latency.py).
+projection math (previously split between scan_engine.py and
+diagnostics/calibrate_line.py), and the get_position()-based
+move-start-lag measurement machinery (used live by diagnostics/timing_check.py).
 
-Kept together because the scan loop in Main.py needs both at once: it
+Kept together because the scan loop in scan_engine.py needs both at once: it
 measures the real per-line motion-start lag while a row is being acquired,
 then feeds that measured lag into the trapezoidal projection to place that
 row's samples on the X axis.
@@ -144,6 +144,25 @@ def sample_positions_for_motion(
         * position_after_elapsed(profile, elapsed_s - motion_start_offset_s)
         for elapsed_s in elapsed_times
     ]
+
+
+def sample_positions_from_trace(sample_abs_times, trace_t, trace_x):
+    """
+    Map ADC sample timestamps to measured stage position by interpolating a
+    MoveStartLagMonitor(track_full_trace=True) trace, instead of assuming
+    the modeled trapezoidal profile. sample_abs_times must be on the same
+    time.perf_counter() clock as trace_t. Timestamps outside the trace's
+    covered span are clamped to the nearest end (np.interp behavior).
+    """
+    trace_t = np.asarray(trace_t, dtype=float)
+    trace_x = np.asarray(trace_x, dtype=float)
+    sample_abs_times = np.asarray(sample_abs_times, dtype=float)
+
+    if len(trace_t) == 0:
+        return np.full(len(sample_abs_times), np.nan)
+
+    order = np.argsort(trace_t)
+    return np.interp(sample_abs_times, trace_t[order], trace_x[order])
 
 
 def profile_positions(profile, elapsed_s):
@@ -323,23 +342,56 @@ class MoveStartLagMonitor:
     Polling uses get_position(refresh=False) and get_status_bits(), both of
     which just read the DLL's background-polling cache with no extra device
     round trip or artificial sleep, so the loop runs as fast as Python/ctypes
-    allow. It stops as soon as it has detected motion, so it only contends
-    with the main thread for the GIL for a brief window right after the move
-    is issued, not for the whole read.
+    allow. In the default mode it stops as soon as it has detected motion, so
+    it only contends with the main thread for the GIL for a brief window
+    right after the move is issued, not for the whole read.
+
+    Pass track_full_trace=True to instead keep polling for the whole move,
+    recording every (t, position) sample as self.trace_t / self.trace_x.
+    That gives the real measured position-vs-time curve for the row, which
+    can be used to place ADC samples directly instead of trusting the
+    modeled trapezoidal profile. This still only reads the DLL's cached
+    position (no extra round trip), so it doesn't add wall-clock time to the
+    move -- call stop() once the caller knows the move has finished (e.g.
+    after wait_until_stopped()) to end the polling loop.
+
+    Pass watch_for_stop=True to also keep polling (regardless of
+    track_full_trace) until the moving status bit clears after having been
+    seen set, recording that instant as self.motion_stopped_t. Poll it from
+    another thread via has_stopped() -- e.g. as a burst_read_binary
+    stop_condition, so a fixed-duration burst read can instead run until the
+    row's motion has actually finished. has_stopped() is a plain attribute
+    read (no DLL call), so the *only* thread touching the motor DLL during
+    the row is this monitor's -- important because the Kinesis DLL is not
+    documented as safe for concurrent calls on the same channel.
     """
 
-    def __init__(self, motor, pos0, position_threshold_mm: float = 0.0005, timeout_s: float = 5.0):
+    def __init__(
+        self,
+        motor,
+        pos0,
+        position_threshold_mm: float = 0.0005,
+        timeout_s: float = 5.0,
+        track_full_trace: bool = False,
+        watch_for_stop: bool = False,
+    ):
         self.motor = motor
         self.pos0 = pos0
         self.position_threshold_mm = position_threshold_mm
         self.timeout_s = timeout_s
+        self.track_full_trace = track_full_trace
+        self.watch_for_stop = watch_for_stop
 
         self.last_unchanged_t = None
         self.first_changed_t = None
         self.first_moving_bit_t = None
+        self.motion_stopped_t = None
         self.n_polls = 0
+        self.trace_t = []
+        self.trace_x = []
 
         self._thread = None
+        self._stop_event = threading.Event()
 
     def start(self):
         start_perf = time.perf_counter()
@@ -348,22 +400,54 @@ class MoveStartLagMonitor:
         self._thread.start()
         return self
 
+    def stop(self):
+        """Signal the polling loop to end; only relevant with track_full_trace."""
+        self._stop_event.set()
+
     def _run(self, start_perf):
         deadline = start_perf + self.timeout_s
-        while time.perf_counter() < deadline:
+        while time.perf_counter() < deadline and not self._stop_event.is_set():
             t_poll = time.perf_counter()
             pos = self.motor.get_position(real_unit=True, refresh=False)
             moving = bool(self.motor.get_status_bits() & MOVING_STATUS_MASK)
             self.n_polls += 1
 
+            if self.track_full_trace:
+                self.trace_t.append(t_poll)
+                self.trace_x.append(pos)
+
             if self.first_moving_bit_t is None and moving:
                 self.first_moving_bit_t = t_poll
 
-            if abs(pos - self.pos0) > self.position_threshold_mm:
+            if self.first_changed_t is None and abs(pos - self.pos0) > self.position_threshold_mm:
                 self.first_changed_t = t_poll
-                return
+                if not self.track_full_trace and not self.watch_for_stop:
+                    return
+            elif self.first_changed_t is None:
+                self.last_unchanged_t = t_poll
 
-            self.last_unchanged_t = t_poll
+            saw_motion = self.first_moving_bit_t is not None or self.first_changed_t is not None
+            # Deliberately gated on first_moving_bit_t alone, not saw_motion:
+            # position and status bits are independently cached by the DLL's
+            # background poller and don't necessarily refresh in lockstep. If
+            # a poll catches the position cache already showing a moved tick
+            # (position_threshold_mm is sub-device-step, so this fires
+            # essentially immediately) while the status-bit cache hasn't
+            # caught up to "moving" yet, using saw_motion here would latch
+            # motion_stopped_t right at that instant -- a false stop maybe
+            # 1 poll into a move that's barely started. Requiring the moving
+            # bit to have actually been observed True first means "stopped"
+            # can only be concluded from the same signal (the status bit)
+            # transitioning true->false, not a mix of two racy signals.
+            if (
+                self.watch_for_stop
+                and self.motion_stopped_t is None
+                and self.first_moving_bit_t is not None
+                and not moving
+            ):
+                self.motion_stopped_t = t_poll
+                if not self.track_full_trace:
+                    return
 
     def join(self, timeout=None):
         if self._thread is not None:
@@ -372,6 +456,14 @@ class MoveStartLagMonitor:
 
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def has_stopped(self) -> bool:
+        """
+        True once motion has been observed to start and then the moving
+        status bit has cleared again. Safe to poll from another thread while
+        this monitor's own thread is still running (see class docstring).
+        """
+        return self.motion_stopped_t is not None
 
     def result(self, command_issue_perf: float):
         """
@@ -392,6 +484,11 @@ class MoveStartLagMonitor:
                 if self.first_moving_bit_t is None
                 else self.first_moving_bit_t - command_issue_perf
             ),
+            "motion_stopped_lag_s": (
+                None
+                if self.motion_stopped_t is None
+                else self.motion_stopped_t - command_issue_perf
+            ),
             "n_polls_before_detection": self.n_polls,
         }
 
@@ -402,7 +499,7 @@ def measure_move_start_lag(motor, displacement_mm, timeout_s: float = 5.0, posit
     itself and blocks until the lag is measured (and the move has finished).
 
     For measuring the lag of a move issued elsewhere while the calling thread
-    does other concurrent work (the Main.py scan loop's use case), use
+    does other concurrent work (the scan_engine.py scan loop's use case), use
     MoveStartLagMonitor directly instead.
     """
     pos0 = motor.get_position(real_unit=True, refresh=True)

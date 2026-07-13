@@ -2,7 +2,7 @@
 Thorlabs Modular Rack stepper motor driver: DLL bootstrap, connection
 lifecycle, status/position polling, velocity params, and motion (home,
 relative/absolute move, jog, stop). Servo-specific code only; scan/plotting
-logic lives in Main.py.
+logic lives in scan_engine.py.
 """
 
 import os

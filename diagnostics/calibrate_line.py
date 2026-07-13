@@ -7,11 +7,20 @@ time-to-position mapping caused by:
 - trapezoidal stage motion,
 - measured delay between move command and clean burst-read start,
 - the spatial prefix lost during that delay.
+
+Run from anywhere (adds the repo root to sys.path so it can reach the
+drivers/engine one level up):
+
+    python diagnostics/calibrate_line.py
 """
 
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ArduinoSampler import burst_read_binary, close_arduino, open_arduino
 from ThorlabsStepper import ThorlabsError, ThorlabsModularStepperController
@@ -31,7 +40,7 @@ ARDUINO_BAUD = 230400
 # Scan geometry, mm
 x0 = 1.0
 x_span = 1.0
-y0 = 1.0  # reserved for consistency with Main.py
+y0 = 1.0  # reserved for consistency with scan_engine.py
 
 # Motion, real units
 default_acceleration = 4.0  # mm/s^2
@@ -49,7 +58,7 @@ move_tolerance_mm = 0.05
 
 # Output
 UNIFORM_GRID_POINTS = None  # None = same number of points as retained samples
-SAVE_FILE = "calibrate_line_last.npz"
+SAVE_FILE = str(Path(__file__).resolve().parent / "calibrate_line_last.npz")
 REPLAY_FILE = None
 
 # Offline self-test: time-defined signal, like a function generator.
