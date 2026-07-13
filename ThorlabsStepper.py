@@ -571,16 +571,26 @@ class ThorlabsModularStepperController:
             "SBC_SetJogMode",
         )
 
-    def set_jog_step_size(self, step_size: int):
+    def set_jog_step_size(self, step_size: int, real_unit: bool = False):
+        if real_unit:
+            step_size = self.unit_real2device(value=step_size, type=0)
         check_zero(
             self.dll.SBC_SetJogStepSize(self.serial, self.channel, int(step_size)),
             "SBC_SetJogStepSize",
         )
 
-    def get_jog_step_size(self) -> int:
-        return int(self.dll.SBC_GetJogStepSize(self.serial, self.channel))
+    def get_jog_step_size(self, real_unit: bool = False) -> int:
+        step_size = int(self.dll.SBC_GetJogStepSize(self.serial, self.channel))
+        if real_unit:
+            return self.unit_device2real(value=step_size, type=0)
+        return step_size
 
-    def set_jog_velocity_params(self, acceleration: int, max_velocity: int):
+    def set_jog_velocity_params(
+        self, acceleration: int, max_velocity: int, real_unit: bool = False
+    ):
+        if real_unit:
+            acceleration = self.unit_real2device(value=acceleration, type=2)
+            max_velocity = self.unit_real2device(value=max_velocity, type=1)
         check_zero(
             self.dll.SBC_SetJogVelParams(
                 self.serial,

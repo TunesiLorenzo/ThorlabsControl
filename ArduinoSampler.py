@@ -20,10 +20,8 @@ def open_arduino(port="COM3", baud=230400, reset_wait_s=2.0, rx_buffer_size=6553
         time.sleep(reset_wait_s)
     return ser
 
-
 def close_arduino(ser):
     ser.close()
-
 
 def burst_read_binary(
     ser,
@@ -86,7 +84,6 @@ def burst_read_binary(
         "duration": end - start,
     }
 
-
 def plot(samples):
     import matplotlib.pyplot as plt
 
@@ -96,7 +93,6 @@ def plot(samples):
     plt.xlabel("Sample index")
     plt.ylabel("ADC count")
     plt.grid()
-
 
 if __name__ == "__main__":
     ser = open_arduino(port="COM3", baud=230400)

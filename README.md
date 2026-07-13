@@ -69,14 +69,21 @@ Fields:
 - **X/Y center, X/Y span, line spacing** (mm) — scan geometry. The stage
   covers `[center - span/2, center + span/2]` on each axis; Y is stepped
   row by row at `line_spacing`, X is fly-scanned continuously per row.
+- **X jog spacing** (mm) — X step size for the stopped-point jog scan.
 - **Acceleration / max velocity** (mm/s², mm/s) — motion profile used for
   every row.
 - **Max grid points/axis** — display-only downsampling cap for the
   heatmap/surface views; the saved data always keeps every raw sample.
 - **View**: 2D heatmap, 3D surface, or overlaid per-row line plot.
-- **Home Motors** — homes both axes before scanning.
-- **Launch Scan / Stop** — Stop finishes the current row, then ends the
-  scan early instead of cutting a row off mid-move.
+- The small **⊙** button beside X/Y center sets both center fields to the
+  highest sampled point in the current scan.
+- **Launch Scan** runs the continuous X fly scan. **Launch Jog** instead
+  single-step jogs X, waits for each move to finish, reads the actual X
+  position, and averages a stationary ADC burst at that point. This avoids
+  reconstructing X from timing. Rows still step in Y and alternate X direction.
+- **Stop** ends a fly scan after its current row, or a jog scan after its
+  current sampled point.
+- **Home Motors** homes both axes.
 - **Load Saved Scan...** — reload a previously saved `.npz` scan into the
   plot without touching the hardware.
 
@@ -96,6 +103,9 @@ The engine `scan_gui.py` is built on. Its public pieces:
   per-row warning (`COVERAGE_WARN_THRESHOLD`) if a row's actual captured X
   span falls short of what was commanded — i.e. a live check that no row's
   trailing samples got cut off.
+- `run_jog_scan(...)` — runs the stopped-point alternative: each X location
+  is reached with a single-step jog, recorded from the controller's actual
+  position, and paired with the mean of a short stationary ADC burst.
 - `build_scan_grid(scan_rows, max_points=200)` — resamples scan rows onto a
   shared rectangular grid for heatmap/surface plotting.
 - `build_scan_lines(scan_rows)` — reconstructs each row's raw (x, samples)

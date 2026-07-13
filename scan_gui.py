@@ -32,7 +32,9 @@ from scan_engine import (
     build_scan_grid_incremental,
     build_scan_lines_incremental,
     check_connection_and_home,
+    find_scan_max,
     load_scan,
+    run_jog_scan,
     run_scan,
 )
 from ThorlabsStepper import ThorlabsModularStepperController
@@ -50,6 +52,56 @@ HOME_TIMEOUT_S = 30.0
 
 REDRAW_INTERVAL_MS = 250
 DEFAULT_MAX_GRID_POINTS = 200
+JOG_SAMPLE_DURATION_S = 0.05
+
+
+class CircularActionButton(tk.Canvas):
+    """Compact circular, canvas-backed action button."""
+
+    def __init__(self, master, command, symbol, diameter=30):
+        background = ttk.Style().lookup("TFrame", "background") or "#d9d9d9"
+        super().__init__(
+            master,
+            width=diameter,
+            height=diameter,
+            background=background,
+            highlightthickness=0,
+            cursor="hand2",
+            takefocus=True,
+        )
+        self.command = command
+        self._state = "normal"
+        self._circle = self.create_oval(2, 2, diameter - 2, diameter - 2, width=1)
+        self._symbol = self.create_text(
+            diameter / 2, diameter / 2, text=symbol, font=("TkDefaultFont", 12)
+        )
+        self.bind("<Button-1>", self._invoke)
+        self.bind("<Return>", self._invoke)
+        self.bind("<space>", self._invoke)
+        self._update_appearance()
+
+    def _invoke(self, _event=None):
+        if self._state == "normal":
+            self.command()
+
+    def _update_appearance(self):
+        disabled = self._state == "disabled"
+        self.itemconfigure(self._circle, fill="#d9d9d9" if disabled else "#f4f4f4")
+        self.itemconfigure(self._symbol, fill="#888888" if disabled else "#222222")
+        self.configure(cursor="" if disabled else "hand2")
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf and "state" in cnf:
+            kwargs["state"] = cnf["state"]
+            cnf = {key: value for key, value in cnf.items() if key != "state"}
+        state = kwargs.pop("state", None)
+        result = super().configure(cnf, **kwargs)
+        if state is not None:
+            self._state = str(state)
+            self._update_appearance()
+        return result
+
+    config = configure
 
 
 class ScanGUI:
@@ -92,6 +144,7 @@ class ScanGUI:
             ("x_span", "X span (mm)", "1.0"),
             ("y_span", "Y span (mm)", "1.0"),
             ("line_spacing", "Line spacing (mm)", "0.1"),
+            ("jog_spacing", "X jog spacing (mm)", "0.1"),
             ("acceleration", "Acceleration (mm/s^2)", "4.0"),
             ("max_velocity", "Max velocity (mm/s)", "4.0"),
             ("max_grid_points", "Max grid points/axis", str(DEFAULT_MAX_GRID_POINTS)),
@@ -105,6 +158,11 @@ class ScanGUI:
             )
             self.fields[key] = var
 
+        self.center_max_btn = CircularActionButton(
+            panel, command=self._on_center_at_max, symbol="⊙"
+        )
+        self.center_max_btn.grid(row=0, column=2, rowspan=2, padx=(6, 0))
+
         view_row = len(field_defs)
         ttk.Label(panel, text="View").grid(row=view_row, column=0, sticky="w", pady=(12, 2))
         ttk.Radiobutton(
@@ -113,35 +171,44 @@ class ScanGUI:
             variable=self.view_mode,
             value="heatmap",
             command=self._redraw,
-        ).grid(row=view_row + 1, column=0, columnspan=2, sticky="w")
+        ).grid(row=view_row + 1, column=0, columnspan=3, sticky="w")
         ttk.Radiobutton(
             panel,
             text="3D Surface",
             variable=self.view_mode,
             value="surface",
             command=self._redraw,
-        ).grid(row=view_row + 2, column=0, columnspan=2, sticky="w")
+        ).grid(row=view_row + 2, column=0, columnspan=3, sticky="w")
         ttk.Radiobutton(
             panel,
             text="Overlaid Lines",
             variable=self.view_mode,
             value="lines",
             command=self._redraw,
-        ).grid(row=view_row + 3, column=0, columnspan=2, sticky="w")
+        ).grid(row=view_row + 3, column=0, columnspan=3, sticky="w")
 
         btn_row = view_row + 4
-        self.home_btn = ttk.Button(panel, text="Home Motors", command=self._on_home)
-        self.home_btn.grid(row=btn_row, column=0, columnspan=2, sticky="ew", pady=(12, 2))
-        self.launch_btn = ttk.Button(panel, text="Launch Scan", command=self._on_launch)
-        self.launch_btn.grid(row=btn_row + 1, column=0, columnspan=2, sticky="ew", pady=2)
+        launch_frame = ttk.Frame(panel)
+        launch_frame.grid(row=btn_row, column=0, columnspan=3, sticky="ew", pady=(12, 2))
+        launch_frame.columnconfigure((0, 1), weight=1)
+        self.launch_btn = ttk.Button(launch_frame, text="Launch Scan", command=self._on_launch)
+        self.launch_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        self.launch_jog_btn = ttk.Button(
+            launch_frame, text="Launch Jog", command=self._on_launch_jog
+        )
+        self.launch_jog_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
         self.stop_btn = ttk.Button(panel, text="Stop", command=self._on_stop, state="disabled")
-        self.stop_btn.grid(row=btn_row + 2, column=0, columnspan=2, sticky="ew", pady=2)
+        self.stop_btn.grid(row=btn_row + 1, column=0, columnspan=3, sticky="ew", pady=2)
         ttk.Button(
             panel, text="Load Saved Scan...", command=self._on_load
-        ).grid(row=btn_row + 3, column=0, columnspan=2, sticky="ew", pady=2)
+        ).grid(row=btn_row + 2, column=0, columnspan=3, sticky="ew", pady=2)
+        self.home_btn = ttk.Button(panel, text="Home Motors", command=self._on_home)
+        self.home_btn.grid(
+            row=btn_row + 3, column=0, columnspan=3, sticky="ew", pady=2
+        )
 
         ttk.Label(panel, textvariable=self.status_var, wraplength=180).grid(
-            row=btn_row + 4, column=0, columnspan=2, sticky="w", pady=(12, 0)
+            row=btn_row + 4, column=0, columnspan=3, sticky="w", pady=(12, 0)
         )
 
     def _build_plot(self):
@@ -167,6 +234,7 @@ class ScanGUI:
                 "x_span": float(self.fields["x_span"].get()),
                 "y_span": float(self.fields["y_span"].get()),
                 "line_spacing": float(self.fields["line_spacing"].get()),
+                "jog_spacing": float(self.fields["jog_spacing"].get()),
                 "acceleration": float(self.fields["acceleration"].get()),
                 "max_velocity": float(self.fields["max_velocity"].get()),
                 "max_grid_points": max(2, int(float(self.fields["max_grid_points"].get()))),
@@ -183,6 +251,12 @@ class ScanGUI:
     # ------------------------------------------------------------ actions
 
     def _on_launch(self):
+        self._start_scan("fly")
+
+    def _on_launch_jog(self):
+        self._start_scan("jog")
+
+    def _start_scan(self, scan_mode):
         if self.worker is not None and self.worker.is_alive():
             return
         try:
@@ -197,16 +271,19 @@ class ScanGUI:
         self._render_future = None  # abandon any in-flight render of the old scan
         self.stop_event = threading.Event()
         self.launch_btn.configure(state="disabled")
+        self.launch_jog_btn.configure(state="disabled")
         self.home_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_var.set("Starting scan...")
+        self.status_var.set(
+            "Starting jog scan..." if scan_mode == "jog" else "Starting scan..."
+        )
 
         def progress_callback(row_dict, row_index, total_rows):
             self.result_queue.put(("row", row_dict, row_index, total_rows))
 
         def worker_fn():
             try:
-                scan_rows = run_scan(
+                common_args = dict(
                     serial=SERIAL,
                     arduino_port=ARDUINO_PORT,
                     arduino_baud=ARDUINO_BAUD,
@@ -218,13 +295,23 @@ class ScanGUI:
                     acceleration=params["acceleration"],
                     max_velocity=params["max_velocity"],
                     row_settle_s=ROW_SETTLE_S,
-                    read_safety_factor=READ_SAFETY_FACTOR,
-                    read_overhead_s=READ_OVERHEAD_S,
                     skip_homing_check=SKIP_HOMING_CHECK,
                     save_file=SAVE_FILE,
                     progress_callback=progress_callback,
                     stop_event=self.stop_event,
                 )
+                if scan_mode == "jog":
+                    scan_rows = run_jog_scan(
+                        **common_args,
+                        jog_spacing=params["jog_spacing"],
+                        sample_duration_s=JOG_SAMPLE_DURATION_S,
+                    )
+                else:
+                    scan_rows = run_scan(
+                        **common_args,
+                        read_safety_factor=READ_SAFETY_FACTOR,
+                        read_overhead_s=READ_OVERHEAD_S,
+                    )
                 self.result_queue.put(("done", scan_rows))
             except Exception as exc:
                 self.result_queue.put(("error", str(exc)))
@@ -235,12 +322,29 @@ class ScanGUI:
     def _on_stop(self):
         if self.stop_event is not None:
             self.stop_event.set()
-            self.status_var.set("Stopping after current row...")
+            self.status_var.set("Stopping safely...")
+
+    def _on_center_at_max(self):
+        maximum = find_scan_max(self.scan_rows)
+        if maximum is None:
+            messagebox.showinfo(
+                "No sampled point",
+                "Run or load a scan containing samples before setting the center.",
+            )
+            return
+
+        x, y, value = maximum
+        self.fields["x0"].set(f"{x:.9g}")
+        self.fields["y0"].set(f"{y:.9g}")
+        self.status_var.set(
+            f"Center set to scan max: X={x:.6g} mm, Y={y:.6g} mm (ADC={value:.6g})."
+        )
 
     def _on_home(self):
         if self.worker is not None and self.worker.is_alive():
             return
         self.launch_btn.configure(state="disabled")
+        self.launch_jog_btn.configure(state="disabled")
         self.home_btn.configure(state="disabled")
         self.status_var.set("Homing motors...")
 
@@ -303,6 +407,7 @@ class ScanGUI:
                     self.dirty = True
                     self.status_var.set(f"Scan finished: {len(scan_rows)} row(s).")
                     self.launch_btn.configure(state="normal")
+                    self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                 elif kind == "error":
@@ -310,17 +415,20 @@ class ScanGUI:
                     self.status_var.set(f"Scan failed: {error_text}")
                     messagebox.showerror("Scan failed", error_text)
                     self.launch_btn.configure(state="normal")
+                    self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                 elif kind == "home_done":
                     self.status_var.set("Homing complete.")
                     self.launch_btn.configure(state="normal")
+                    self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
                 elif kind == "home_error":
                     _, error_text = message
                     self.status_var.set(f"Homing failed: {error_text}")
                     messagebox.showerror("Homing failed", error_text)
                     self.launch_btn.configure(state="normal")
+                    self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
         except queue.Empty:
             pass
