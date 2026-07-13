@@ -254,6 +254,7 @@ class ScanGUI:
         self._start_scan("fly")
 
     def _on_launch_jog(self):
+        self.view_mode.set("lines")
         self._start_scan("jog")
 
     def _start_scan(self, scan_mode):
@@ -283,34 +284,42 @@ class ScanGUI:
 
         def worker_fn():
             try:
-                common_args = dict(
-                    serial=SERIAL,
-                    arduino_port=ARDUINO_PORT,
-                    arduino_baud=ARDUINO_BAUD,
-                    x0=params["x0"],
-                    y0=params["y0"],
-                    x_span=params["x_span"],
-                    y_span=params["y_span"],
-                    line_spacing=params["line_spacing"],
-                    acceleration=params["acceleration"],
-                    max_velocity=params["max_velocity"],
-                    row_settle_s=ROW_SETTLE_S,
-                    skip_homing_check=SKIP_HOMING_CHECK,
-                    save_file=SAVE_FILE,
-                    progress_callback=progress_callback,
-                    stop_event=self.stop_event,
-                )
                 if scan_mode == "jog":
                     scan_rows = run_jog_scan(
-                        **common_args,
+                        serial=SERIAL,
+                        arduino_port=ARDUINO_PORT,
+                        arduino_baud=ARDUINO_BAUD,
+                        x0=params["x0"],
+                        y0=params["y0"],
+                        x_span=params["x_span"],
                         jog_spacing=params["jog_spacing"],
+                        acceleration=params["acceleration"],
+                        max_velocity=params["max_velocity"],
                         sample_duration_s=JOG_SAMPLE_DURATION_S,
+                        skip_homing_check=SKIP_HOMING_CHECK,
+                        save_file=SAVE_FILE,
+                        progress_callback=progress_callback,
+                        stop_event=self.stop_event,
                     )
                 else:
                     scan_rows = run_scan(
-                        **common_args,
+                        serial=SERIAL,
+                        arduino_port=ARDUINO_PORT,
+                        arduino_baud=ARDUINO_BAUD,
+                        x0=params["x0"],
+                        y0=params["y0"],
+                        x_span=params["x_span"],
+                        y_span=params["y_span"],
+                        line_spacing=params["line_spacing"],
+                        acceleration=params["acceleration"],
+                        max_velocity=params["max_velocity"],
+                        row_settle_s=ROW_SETTLE_S,
+                        skip_homing_check=SKIP_HOMING_CHECK,
+                        save_file=SAVE_FILE,
+                        progress_callback=progress_callback,
                         read_safety_factor=READ_SAFETY_FACTOR,
                         read_overhead_s=READ_OVERHEAD_S,
+                        stop_event=self.stop_event,
                     )
                 self.result_queue.put(("done", scan_rows))
             except Exception as exc:
@@ -398,7 +407,17 @@ class ScanGUI:
                 kind = message[0]
                 if kind == "row":
                     _, row_dict, row_index, total_rows = message
-                    self.scan_rows.append(row_dict)
+                    if row_index < len(self.scan_rows):
+                        # Replacing (not appending): this is a jog line scan's
+                        # row growing point-by-point as a new dict each time.
+                        # The grid/position cache keys on id(row), and a
+                        # discarded row dict's id can be reused by the next
+                        # one, so it must be dropped here to avoid a stale
+                        # cache hit against a shorter, previously-cached row.
+                        self.scan_rows[row_index] = row_dict
+                        self._grid_cache = {}
+                    else:
+                        self.scan_rows.append(row_dict)
                     self.dirty = True
                     self.status_var.set(f"Row {row_index + 1}/{total_rows} complete.")
                 elif kind == "done":
