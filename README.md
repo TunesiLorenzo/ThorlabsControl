@@ -74,11 +74,6 @@ Fields:
 - **Max grid points/axis** — display-only downsampling cap for the
   heatmap/surface views; the saved data always keeps every raw sample.
 - **View**: 2D heatmap, 3D surface, or overlaid per-row line plot.
-- **Sampler strategy**: how each ADC sample's X position is reconstructed —
-  *measured position trace* (interpolated from a continuously polled real
-  position log, the default and generally more accurate) or *modeled
-  trapezoidal profile* (computed from the commanded acceleration/velocity
-  instead of measured motion).
 - **Home Motors** — homes both axes before scanning.
 - **Launch Scan / Stop** — Stop finishes the current row, then ends the
   scan early instead of cutting a row off mid-move.
@@ -97,7 +92,10 @@ The engine `scan_gui.py` is built on. Its public pieces:
   and returns `scan_rows` (also saved to `.npz` if `save_file` is given).
   Accepts a `progress_callback` (per-row) and a `stop_event` for GUI use,
   and per-row records rich timing/lag metadata (see
-  `print_scan_timing_stats`) used by the diagnostics tools.
+  `print_scan_timing_stats`) used by the diagnostics tools. Prints a
+  per-row warning (`COVERAGE_WARN_THRESHOLD`) if a row's actual captured X
+  span falls short of what was commanded — i.e. a live check that no row's
+  trailing samples got cut off.
 - `build_scan_grid(scan_rows, max_points=200)` — resamples scan rows onto a
   shared rectangular grid for heatmap/surface plotting.
 - `build_scan_lines(scan_rows)` — reconstructs each row's raw (x, samples)
@@ -132,13 +130,20 @@ scan without the GUI.
   than modeled.
 - **`motion_timing.py`** — shared math used by both the scan engine and the
   diagnostics tools: `motion_profile`/`expected_move_time`/
-  `sampling_duration_for_move` (trapezoidal velocity profile), functions to
-  place ADC samples on the X axis either from the modeled profile or from a
-  measured position trace, and `MoveStartLagMonitor` — a background thread
-  that polls the stage's cached position/status to measure, in real time,
-  when a move actually started and actually stopped (instead of assuming
-  command-issue/command-return timing), which the scan engine uses to place
-  samples accurately and to know when it's safe to stop reading.
+  `sampling_duration_for_move` (trapezoidal velocity profile),
+  `sample_positions_for_motion` to place ADC samples on the X axis from that
+  modeled profile (anchored per row by the measured move-start lag, not
+  assumed command-issue timing), and `MoveStartLagMonitor` — a background
+  thread that polls the stage's cached position/status bit to measure, in
+  real time, when a move actually started and actually stopped. Its stop
+  detection requires the moving status bit to have actually been observed
+  `True` (not just a position tick — the two are independently cached and
+  can briefly disagree) and then to read continuously not-moving for a
+  short debounce window, not just once — both aimed at never mistaking a
+  transient/stale reading for a real stop, since that would truncate a
+  row's trailing samples. The scan engine uses this to safely extend a
+  row's read past the modeled duration until the motor is confirmed
+  actually stopped.
 
 ## `diagnostics/` — calibration and hardware bring-up tools
 

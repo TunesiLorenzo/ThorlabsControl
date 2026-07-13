@@ -146,25 +146,6 @@ def sample_positions_for_motion(
     ]
 
 
-def sample_positions_from_trace(sample_abs_times, trace_t, trace_x):
-    """
-    Map ADC sample timestamps to measured stage position by interpolating a
-    MoveStartLagMonitor(track_full_trace=True) trace, instead of assuming
-    the modeled trapezoidal profile. sample_abs_times must be on the same
-    time.perf_counter() clock as trace_t. Timestamps outside the trace's
-    covered span are clamped to the nearest end (np.interp behavior).
-    """
-    trace_t = np.asarray(trace_t, dtype=float)
-    trace_x = np.asarray(trace_x, dtype=float)
-    sample_abs_times = np.asarray(sample_abs_times, dtype=float)
-
-    if len(trace_t) == 0:
-        return np.full(len(sample_abs_times), np.nan)
-
-    order = np.argsort(trace_t)
-    return np.interp(sample_abs_times, trace_t[order], trace_x[order])
-
-
 def profile_positions(profile, elapsed_s):
     """Vectorized (numpy) distance travelled, for calibration/mapping work."""
     elapsed = np.clip(np.asarray(elapsed_s, dtype=float), 0.0, profile["total_time"])
@@ -346,24 +327,35 @@ class MoveStartLagMonitor:
     it only contends with the main thread for the GIL for a brief window
     right after the move is issued, not for the whole read.
 
-    Pass track_full_trace=True to instead keep polling for the whole move,
-    recording every (t, position) sample as self.trace_t / self.trace_x.
-    That gives the real measured position-vs-time curve for the row, which
-    can be used to place ADC samples directly instead of trusting the
-    modeled trapezoidal profile. This still only reads the DLL's cached
-    position (no extra round trip), so it doesn't add wall-clock time to the
-    move -- call stop() once the caller knows the move has finished (e.g.
-    after wait_until_stopped()) to end the polling loop.
+    Pass watch_for_stop=True to instead keep polling for the whole move,
+    until the moving status bit has been seen set and then cleared again,
+    recording that instant as self.motion_stopped_t. Poll it from another
+    thread via has_stopped() -- e.g. as a burst_read_binary stop_condition,
+    so a fixed-duration burst read can instead run until the row's motion
+    has actually finished, and the modeled trapezoidal profile used to place
+    ADC samples on the X axis (see sample_positions_for_motion) can be
+    anchored by this measured lag data instead of assumed command-issue
+    timing. has_stopped() is a plain attribute read (no DLL call), so the
+    *only* thread touching the motor DLL during the row is this monitor's --
+    important because the Kinesis DLL is not documented as safe for
+    concurrent calls on the same channel.
 
-    Pass watch_for_stop=True to also keep polling (regardless of
-    track_full_trace) until the moving status bit clears after having been
-    seen set, recording that instant as self.motion_stopped_t. Poll it from
-    another thread via has_stopped() -- e.g. as a burst_read_binary
-    stop_condition, so a fixed-duration burst read can instead run until the
-    row's motion has actually finished. has_stopped() is a plain attribute
-    read (no DLL call), so the *only* thread touching the motor DLL during
-    the row is this monitor's -- important because the Kinesis DLL is not
-    documented as safe for concurrent calls on the same channel.
+    The stop check requires two things before it will ever latch
+    motion_stopped_t, both aimed at never mistaking a transient read for a
+    real stop -- missing a row's trailing samples is worse than running a
+    row a little long:
+    - the moving bit must have actually been observed True at least once
+      (self.first_moving_bit_t) -- gating on a position tick instead (they're
+      independently cached by the DLL's background poller and don't
+      necessarily refresh in lockstep) can see "not moving" one poll before
+      the status-bit cache has caught up to a move that's barely started;
+    - the moving bit must then read continuously not-set for at least
+      stop_confirm_s, not just once -- a single-poll debounce against a
+      stale/glitched cache read at any point during the move, not just the
+      start. Any "moving=True" poll during that window resets the count.
+    If neither condition is ever satisfied, has_stopped() simply never
+    returns True and the caller's hard_timeout is what ends the read --
+    always the safe direction to fail in.
     """
 
     def __init__(
@@ -372,24 +364,23 @@ class MoveStartLagMonitor:
         pos0,
         position_threshold_mm: float = 0.0005,
         timeout_s: float = 5.0,
-        track_full_trace: bool = False,
         watch_for_stop: bool = False,
+        stop_confirm_s: float = 0.003,
     ):
         self.motor = motor
         self.pos0 = pos0
         self.position_threshold_mm = position_threshold_mm
         self.timeout_s = timeout_s
-        self.track_full_trace = track_full_trace
         self.watch_for_stop = watch_for_stop
+        self.stop_confirm_s = stop_confirm_s
 
         self.last_unchanged_t = None
         self.first_changed_t = None
         self.first_moving_bit_t = None
         self.motion_stopped_t = None
         self.n_polls = 0
-        self.trace_t = []
-        self.trace_x = []
 
+        self._not_moving_since = None
         self._thread = None
         self._stop_event = threading.Event()
 
@@ -401,7 +392,9 @@ class MoveStartLagMonitor:
         return self
 
     def stop(self):
-        """Signal the polling loop to end; only relevant with track_full_trace."""
+        """Signal the polling loop to end early (e.g. once the caller has
+        confirmed via other means, like wait_until_stopped(), that the move
+        is over -- otherwise the loop just runs until timeout_s)."""
         self._stop_event.set()
 
     def _run(self, start_perf):
@@ -412,42 +405,28 @@ class MoveStartLagMonitor:
             moving = bool(self.motor.get_status_bits() & MOVING_STATUS_MASK)
             self.n_polls += 1
 
-            if self.track_full_trace:
-                self.trace_t.append(t_poll)
-                self.trace_x.append(pos)
-
             if self.first_moving_bit_t is None and moving:
                 self.first_moving_bit_t = t_poll
 
             if self.first_changed_t is None and abs(pos - self.pos0) > self.position_threshold_mm:
                 self.first_changed_t = t_poll
-                if not self.track_full_trace and not self.watch_for_stop:
+                if not self.watch_for_stop:
                     return
             elif self.first_changed_t is None:
                 self.last_unchanged_t = t_poll
 
-            saw_motion = self.first_moving_bit_t is not None or self.first_changed_t is not None
-            # Deliberately gated on first_moving_bit_t alone, not saw_motion:
-            # position and status bits are independently cached by the DLL's
-            # background poller and don't necessarily refresh in lockstep. If
-            # a poll catches the position cache already showing a moved tick
-            # (position_threshold_mm is sub-device-step, so this fires
-            # essentially immediately) while the status-bit cache hasn't
-            # caught up to "moving" yet, using saw_motion here would latch
-            # motion_stopped_t right at that instant -- a false stop maybe
-            # 1 poll into a move that's barely started. Requiring the moving
-            # bit to have actually been observed True first means "stopped"
-            # can only be concluded from the same signal (the status bit)
-            # transitioning true->false, not a mix of two racy signals.
-            if (
-                self.watch_for_stop
-                and self.motion_stopped_t is None
-                and self.first_moving_bit_t is not None
-                and not moving
-            ):
-                self.motion_stopped_t = t_poll
-                if not self.track_full_trace:
-                    return
+            if self.watch_for_stop and self.motion_stopped_t is None and self.first_moving_bit_t is not None:
+                if moving:
+                    self._not_moving_since = None
+                else:
+                    if self._not_moving_since is None:
+                        self._not_moving_since = t_poll
+                    elif t_poll - self._not_moving_since >= self.stop_confirm_s:
+                        # Timestamp the start of the confirmed not-moving
+                        # streak, not the (later) poll that confirmed it --
+                        # closer to the real stop instant.
+                        self.motion_stopped_t = self._not_moving_since
+                        return
 
     def join(self, timeout=None):
         if self._thread is not None:

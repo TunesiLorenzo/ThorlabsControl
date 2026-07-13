@@ -10,10 +10,13 @@ from motion_timing import (
     expected_move_time,
     interp_nan,
     sample_positions_for_motion,
-    sample_positions_from_trace,
     sampling_duration_for_move,
 )
 from ThorlabsStepper import ThorlabsError, ThorlabsModularStepperController
+
+# Below this fraction of the commanded X span captured, run_scan() prints a
+# per-row warning (see the coverage spot-check at the end of its row loop).
+COVERAGE_WARN_THRESHOLD = 0.97
 
 
 def build_axis_points(start: float, span: float, spacing: float):
@@ -44,18 +47,13 @@ def load_scan(path):
 
 
 def _row_positions(row):
-    """Map one row's ADC samples to X positions, trace-measured if available."""
+    """
+    Map one row's ADC samples to X positions using the modeled trapezoidal
+    profile (motion_timing.sample_positions_for_motion), anchored by the
+    row's measured move-start lag (motion_start_offset_s) rather than a
+    continuously polled position trace.
+    """
     samples = row["samples"]
-    trace_t = row.get("position_trace_t")
-    trace_x = row.get("position_trace_x")
-
-    if trace_t is not None and len(trace_t) > 1:
-        n = len(samples)
-        span = row.get("sample_span_s", row["read_duration"])
-        anchor = row["sample_window_start_s"]
-        offsets = [span / 2] if n == 1 else np.linspace(0.0, span, n)
-        return sample_positions_from_trace(anchor + np.asarray(offsets), trace_t, trace_x)
-
     return np.asarray(
         sample_positions_for_motion(
             x_start=row["x_start"],
@@ -387,14 +385,6 @@ def run_scan(
     # Position-based move-start-lag detection (see motion_timing.MoveStartLagMonitor).
     move_start_lag_threshold_mm=0.0000005,  # 0.5 nm; must exceed quantization noise
     lag_monitor_timeout_s=2.0,
-    # False: X position per ADC sample is reconstructed from the modeled
-    # trapezoidal profile, anchored by one measured start-lag per row.
-    # True (default): X position per ADC sample is interpolated from a
-    # continuously polled real position trace instead, so it isn't subject
-    # to modeled-vs-actual acceleration mismatch. Costs no extra scan time
-    # (see MoveStartLagMonitor's track_full_trace docstring), only a bit
-    # more per-row memory/GIL contention.
-    use_measured_position_trace=True,
     save_file=None,
     progress_callback=None,
     stop_event=None,
@@ -402,6 +392,16 @@ def run_scan(
     """
     Run one raster scan (X fly-scan per row, stepped in Y) and return
     scan_rows, in the same format plot_scan()/load_scan() expect.
+
+    X position per ADC sample is reconstructed from the modeled trapezoidal
+    profile (motion_timing.sample_positions_for_motion), anchored per row by
+    a measured move-start lag (MoveStartLagMonitor) rather than assumed
+    command-issue timing. The same monitor also watches for the moving
+    status bit to actually clear, which burst_read_binary uses to extend a
+    row's read past the modeled duration until motion has really finished --
+    never cutting a row short just because the model predicted less time
+    than the real move took (see COVERAGE_WARN_THRESHOLD below for a
+    per-row check that this held).
 
     progress_callback(row_dict, row_index, total_rows), if given, is called
     after each row is appended to scan_rows -- e.g. so a GUI can update a
@@ -499,9 +499,9 @@ def run_scan(
             row_wait_timeout_s = max(read_duration + 2.0, move_time * 2.0 + 2.0)
             # watch_for_stop keeps this monitor running (polling the DLL's
             # cached position/status, no extra device round trip) through the
-            # whole row regardless of trace mode, since burst_read_binary's
-            # stop_condition below needs it alive to detect when motion
-            # actually finishes -- not just when it starts.
+            # whole row, since burst_read_binary's stop_condition below needs
+            # it alive to detect when motion actually finishes -- not just
+            # when it starts.
             monitor_timeout_s = row_wait_timeout_s
 
             # Watches get_position()/status bits in the background while this
@@ -513,7 +513,6 @@ def run_scan(
                 pos0=actual_x_start,
                 position_threshold_mm=move_start_lag_threshold_mm,
                 timeout_s=monitor_timeout_s,
-                track_full_trace=use_measured_position_trace,
                 watch_for_stop=True,
             ).start()
 
@@ -543,8 +542,8 @@ def run_scan(
             actual_x_end = motorx.get_position(real_unit=True)
 
             # Only now is the move guaranteed finished, so it's safe to end
-            # the trace-mode polling loop (a no-op if it already stopped
-            # itself in lag-only mode).
+            # the monitor's polling loop (a no-op if it already stopped
+            # itself once it confirmed the moving bit had cleared).
             lag_monitor.stop()
             lag_monitor.join(timeout=lag_monitor_timeout_s)
             lag_result = lag_monitor.result(move_command_issue_s)
@@ -589,19 +588,10 @@ def run_scan(
                     "acceleration": acceleration,
                     "max_velocity": max_velocity,
                     "samples": samples,
-                    "position_trace_t": (
-                        np.array(lag_monitor.trace_t) if use_measured_position_trace else None
-                    ),
-                    "position_trace_x": (
-                        np.array(lag_monitor.trace_x) if use_measured_position_trace else None
-                    ),
                 }
             )
             lag_mid_s = scan_rows[-1]["measured_lag_midpoint_s"]
             lag_mid_str = "n/a" if lag_mid_s is None else f"{lag_mid_s * 1000:.2f} ms"
-            trace_str = (
-                f", trace_pts={len(lag_monitor.trace_t)}" if use_measured_position_trace else ""
-            )
             # >0 means this row's read ran past the nominal read_duration
             # waiting for stop_condition (i.e. the fix actually engaged this
             # row); ~0 means the row finished within the nominal budget.
@@ -610,11 +600,27 @@ def run_scan(
                 f"Row {row_index + 1}/{len(y_points)}: "
                 f"y={actual_y:.6f}, "
                 f"x={actual_x_start:.6f}->{actual_x_end:.6f}, "
-                f"samples={len(samples)}{trace_str}, "
+                f"samples={len(samples)}, "
                 f"cmd->read={scan_rows[-1]['move_to_read_start_s'] * 1000:.2f} ms, "
                 f"measured lag mid={lag_mid_str}, "
                 f"extra read past nominal={extra_read_s * 1000:.2f} ms"
             )
+
+            # Spot-check this row's actual captured span against what was
+            # commanded, using the same X reconstruction the plots use --
+            # i.e. did the motor really finish before the read stopped.
+            # Should always be ~100% given the stop-detection above; if not,
+            # something's still letting a row get cut short.
+            row_xs = _row_positions(scan_rows[-1])
+            if len(row_xs) and x_span > 0:
+                captured = float(np.max(row_xs) - np.min(row_xs))
+                coverage = captured / x_span
+                if coverage < COVERAGE_WARN_THRESHOLD:
+                    print(
+                        f"  WARNING: row {row_index} captured only {coverage:.1%} of the "
+                        f"commanded span ({captured:.4f}/{x_span:.4f} mm) -- the read may "
+                        "have stopped before the motor actually finished."
+                    )
 
             if progress_callback is not None:
                 progress_callback(scan_rows[-1], row_index, len(y_points))

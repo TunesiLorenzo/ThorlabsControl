@@ -87,7 +87,6 @@ def run_trial(motorx, ser, trial_index, x_displacement, move_time, read_duration
         pos0=actual_x_start,
         position_threshold_mm=MOVE_START_LAG_THRESHOLD_MM,
         timeout_s=row_wait_timeout_s,
-        track_full_trace=False,
         watch_for_stop=True,
     ).start()
 

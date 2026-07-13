@@ -72,7 +72,6 @@ class ScanGUI:
         self._render_future = None
 
         self.view_mode = tk.StringVar(value="heatmap")
-        self.sampler_strategy = tk.StringVar(value="measured_trace")
         self.status_var = tk.StringVar(value="Idle.")
 
         self._build_controls()
@@ -130,24 +129,7 @@ class ScanGUI:
             command=self._redraw,
         ).grid(row=view_row + 3, column=0, columnspan=2, sticky="w")
 
-        sampler_row = view_row + 4
-        ttk.Label(panel, text="Sampler Strategy").grid(
-            row=sampler_row, column=0, sticky="w", pady=(12, 2)
-        )
-        ttk.Radiobutton(
-            panel,
-            text="Measured position trace",
-            variable=self.sampler_strategy,
-            value="measured_trace",
-        ).grid(row=sampler_row + 1, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(
-            panel,
-            text="Modeled trapezoidal profile",
-            variable=self.sampler_strategy,
-            value="modeled_profile",
-        ).grid(row=sampler_row + 2, column=0, columnspan=2, sticky="w")
-
-        btn_row = sampler_row + 3
+        btn_row = view_row + 4
         self.home_btn = ttk.Button(panel, text="Home Motors", command=self._on_home)
         self.home_btn.grid(row=btn_row, column=0, columnspan=2, sticky="ew", pady=(12, 2))
         self.launch_btn = ttk.Button(panel, text="Launch Scan", command=self._on_launch)
@@ -218,7 +200,6 @@ class ScanGUI:
         self.home_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_var.set("Starting scan...")
-        use_measured_position_trace = self.sampler_strategy.get() == "measured_trace"
 
         def progress_callback(row_dict, row_index, total_rows):
             self.result_queue.put(("row", row_dict, row_index, total_rows))
@@ -240,7 +221,6 @@ class ScanGUI:
                     read_safety_factor=READ_SAFETY_FACTOR,
                     read_overhead_s=READ_OVERHEAD_S,
                     skip_homing_check=SKIP_HOMING_CHECK,
-                    use_measured_position_trace=use_measured_position_trace,
                     save_file=SAVE_FILE,
                     progress_callback=progress_callback,
                     stop_event=self.stop_event,
