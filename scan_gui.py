@@ -104,6 +104,301 @@ class CircularActionButton(tk.Canvas):
     config = configure
 
 
+class ManualControlWindow:
+    """
+    Standalone window for jogging/positioning the X/Y stage outside of a
+    scan. Owns its own motor connections (opened on init, closed on
+    close), so the caller must keep this mutually exclusive with a live
+    scan or the homing routine -- see ScanGUI._on_manual_control /
+    _on_manual_control_closed, which disable each side's launch buttons
+    while the other is active.
+
+    All Kinesis calls happen on a single dedicated worker thread (commands
+    pushed through self._command_queue, results read back through
+    self._result_queue and applied to widgets from the Tk main loop via
+    after()-polling) so overlapping button clicks can't call into the DLL
+    from two threads at once. STOP is the one exception -- it calls
+    stop_profiled() directly from the UI thread so it takes effect
+    immediately even while a move is in flight on the worker thread.
+    """
+
+    def __init__(self, master, serial, defaults, on_close):
+        self.serial = serial
+        self.on_close = on_close
+        self._result_queue = queue.Queue()
+        self._command_queue = queue.Queue()
+        self.motorx = None
+        self.motory = None
+        self._closed = False
+
+        self.top = tk.Toplevel(master)
+        self.top.title("Manual XY Control")
+        self.top.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+        self.status_var = tk.StringVar(value="Connecting...")
+        self.x_pos_var = tk.StringVar(value="--")
+        self.y_pos_var = tk.StringVar(value="--")
+
+        self.step_var = tk.StringVar(value="0.01")
+        self.accel_var = tk.StringVar(value=defaults.get("acceleration", "4.0"))
+        self.vel_var = tk.StringVar(value=defaults.get("max_velocity", "4.0"))
+        self.abs_x_var = tk.StringVar(value=defaults.get("x0", "0.0"))
+        self.abs_y_var = tk.StringVar(value=defaults.get("y0", "0.0"))
+
+        self._build_ui()
+
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+        self._command_queue.put(("connect",))
+
+        self.top.after(150, self._poll_queue)
+
+    # ---------------------------------------------------------------- UI
+
+    def _build_ui(self):
+        frame = ttk.Frame(self.top, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+
+        pos_frame = ttk.LabelFrame(frame, text="Current position", padding=8)
+        pos_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(pos_frame, text="X (mm):").grid(row=0, column=0, sticky="w")
+        ttk.Label(pos_frame, textvariable=self.x_pos_var).grid(
+            row=0, column=1, sticky="w", padx=(4, 16)
+        )
+        ttk.Label(pos_frame, text="Y (mm):").grid(row=0, column=2, sticky="w")
+        ttk.Label(pos_frame, textvariable=self.y_pos_var).grid(
+            row=0, column=3, sticky="w", padx=(4, 0)
+        )
+        self.refresh_btn = ttk.Button(pos_frame, text="Refresh", command=self._on_refresh)
+        self.refresh_btn.grid(row=0, column=4, padx=(12, 0))
+
+        speed_frame = ttk.LabelFrame(frame, text="Speed", padding=8)
+        speed_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(speed_frame, text="Acceleration (mm/s^2)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(speed_frame, textvariable=self.accel_var, width=10).grid(
+            row=0, column=1, padx=(6, 12)
+        )
+        ttk.Label(speed_frame, text="Max velocity (mm/s)").grid(row=0, column=2, sticky="w")
+        ttk.Entry(speed_frame, textvariable=self.vel_var, width=10).grid(
+            row=0, column=3, padx=(6, 12)
+        )
+        self.apply_speed_btn = ttk.Button(speed_frame, text="Apply", command=self._on_apply_speed)
+        self.apply_speed_btn.grid(row=0, column=4)
+
+        abs_frame = ttk.LabelFrame(frame, text="Absolute move", padding=8)
+        abs_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(abs_frame, text="X target (mm)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(abs_frame, textvariable=self.abs_x_var, width=10).grid(
+            row=0, column=1, padx=(6, 12)
+        )
+        ttk.Label(abs_frame, text="Y target (mm)").grid(row=0, column=2, sticky="w")
+        ttk.Entry(abs_frame, textvariable=self.abs_y_var, width=10).grid(
+            row=0, column=3, padx=(6, 12)
+        )
+        self.move_abs_btn = ttk.Button(abs_frame, text="Move", command=self._on_move_absolute)
+        self.move_abs_btn.grid(row=0, column=4)
+
+        jog_frame = ttk.LabelFrame(frame, text="Jog", padding=8)
+        jog_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(jog_frame, text="Step (mm)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(jog_frame, textvariable=self.step_var, width=10).grid(
+            row=0, column=1, padx=(6, 0), pady=(0, 8), sticky="w"
+        )
+
+        pad_frame = ttk.Frame(jog_frame)
+        pad_frame.grid(row=1, column=0, columnspan=4)
+        self.jog_buttons = {}
+        specs = [
+            ("y+", "▲ Y+", 0, 1),
+            ("x-", "◀ X-", 1, 0),
+            ("x+", "X+ ▶", 1, 2),
+            ("y-", "▼ Y-", 2, 1),
+        ]
+        for key, label, r, c in specs:
+            btn = ttk.Button(pad_frame, text=label, width=8, command=lambda k=key: self._on_jog(k))
+            btn.grid(row=r, column=c, padx=4, pady=4)
+            self.jog_buttons[key] = btn
+
+        self.stop_btn = ttk.Button(frame, text="STOP", command=self._on_stop)
+        self.stop_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+
+        ttk.Label(frame, textvariable=self.status_var, wraplength=280).grid(
+            row=5, column=0, columnspan=2, sticky="w"
+        )
+
+        self._busy_widgets = [
+            self.refresh_btn,
+            self.apply_speed_btn,
+            self.move_abs_btn,
+        ] + list(self.jog_buttons.values())
+        self._set_controls_enabled(False)
+
+    def _set_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for widget in self._busy_widgets:
+            widget.configure(state=state)
+
+    # ----------------------------------------------------- worker thread
+
+    def _worker_loop(self):
+        while True:
+            command = self._command_queue.get()
+            name = command[0]
+            if name == "shutdown":
+                self._safe_disconnect()
+                return
+            try:
+                if name == "connect":
+                    self._cmd_connect()
+                elif name == "refresh":
+                    pass
+                elif name == "move_absolute":
+                    self._cmd_move_absolute(command[1], command[2])
+                elif name == "jog":
+                    self._cmd_jog(command[1], command[2])
+                elif name == "set_speed":
+                    self._cmd_set_speed(command[1], command[2])
+                self._push_positions()
+                self._result_queue.put(("ready",))
+            except Exception as exc:
+                self._result_queue.put(("error", str(exc)))
+
+    def _cmd_connect(self):
+        self.motorx = ThorlabsModularStepperController(serial=self.serial, channel=1, poll_ms=1)
+        self.motory = ThorlabsModularStepperController(serial=self.serial, channel=2, poll_ms=1)
+        self.motorx.connect()
+        self.motory.connect()
+        try:
+            accel = float(self.accel_var.get())
+            max_vel = float(self.vel_var.get())
+            self._cmd_set_speed(accel, max_vel)
+        except ValueError:
+            pass
+        self._result_queue.put(("connected",))
+
+    def _cmd_move_absolute(self, x_target, y_target):
+        self.motorx.move_absolute(x_target, wait=True, real_unit=True)
+        self.motory.move_absolute(y_target, wait=True, real_unit=True)
+
+    def _cmd_jog(self, axis, delta):
+        motor = self.motorx if axis == "x" else self.motory
+        motor.move_relative(delta, wait=True, real_unit=True)
+
+    def _cmd_set_speed(self, acceleration, max_velocity):
+        self.motorx.set_velocity_params(
+            acceleration=acceleration, max_velocity=max_velocity, real_unit=True
+        )
+        self.motory.set_velocity_params(
+            acceleration=acceleration, max_velocity=max_velocity, real_unit=True
+        )
+
+    def _push_positions(self):
+        x = self.motorx.get_position(real_unit=True)
+        y = self.motory.get_position(real_unit=True)
+        self._result_queue.put(("position", x, y))
+
+    def _safe_disconnect(self):
+        for motor in (self.motorx, self.motory):
+            if motor is not None:
+                try:
+                    motor.safe_shutdown()
+                except Exception:
+                    pass
+
+    # --------------------------------------------------- UI command senders
+
+    def _send(self, command):
+        self._set_controls_enabled(False)
+        self.status_var.set("Working...")
+        self._command_queue.put(command)
+
+    def _on_refresh(self):
+        self._send(("refresh",))
+
+    def _on_apply_speed(self):
+        try:
+            accel = float(self.accel_var.get())
+            max_vel = float(self.vel_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Acceleration and max velocity must be numbers.")
+            return
+        self._send(("set_speed", accel, max_vel))
+
+    def _on_move_absolute(self):
+        try:
+            x_target = float(self.abs_x_var.get())
+            y_target = float(self.abs_y_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "X/Y target must be numbers.")
+            return
+        self._send(("move_absolute", x_target, y_target))
+
+    def _on_jog(self, key):
+        try:
+            step = float(self.step_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Jog step must be a number.")
+            return
+        if step <= 0:
+            messagebox.showerror("Invalid input", "Jog step must be positive.")
+            return
+        axis = "x" if key.startswith("x") else "y"
+        sign = 1.0 if key.endswith("+") else -1.0
+        self._send(("jog", axis, sign * step))
+
+    def _on_stop(self):
+        for motor in (self.motorx, self.motory):
+            if motor is not None:
+                try:
+                    motor.stop_profiled()
+                except Exception:
+                    pass
+        self.status_var.set("Stop requested.")
+
+    # -------------------------------------------------------- queue polling
+
+    def _poll_queue(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                message = self._result_queue.get_nowait()
+                kind = message[0]
+                if kind == "connected":
+                    self.status_var.set("Connected.")
+                    self._set_controls_enabled(True)
+                elif kind == "position":
+                    self.x_pos_var.set(f"{message[1]:.6f}")
+                    self.y_pos_var.set(f"{message[2]:.6f}")
+                elif kind == "ready":
+                    self.status_var.set("Ready.")
+                    self._set_controls_enabled(True)
+                elif kind == "error":
+                    self.status_var.set(f"Error: {message[1]}")
+                    messagebox.showerror("Motor error", message[1])
+                    self._set_controls_enabled(True)
+        except queue.Empty:
+            pass
+        self.top.after(150, self._poll_queue)
+
+    # ------------------------------------------------------------- closing
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._command_queue.put(("shutdown",))
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+    def _on_window_close(self):
+        self.close()
+        if self.on_close is not None:
+            self.on_close()
+
+
 class ScanGUI:
     def __init__(self, root):
         self.root = root
@@ -114,6 +409,7 @@ class ScanGUI:
         self.stop_event = None
         self.scan_rows = []
         self.dirty = False
+        self.manual_window = None
 
         # Grid/line rebuild cache (see scan_engine.build_scan_grid_incremental)
         # and the background thread that runs it during a live scan.
@@ -206,9 +502,15 @@ class ScanGUI:
         self.home_btn.grid(
             row=btn_row + 3, column=0, columnspan=3, sticky="ew", pady=2
         )
+        self.manual_control_btn = ttk.Button(
+            panel, text="Manual Control...", command=self._on_manual_control
+        )
+        self.manual_control_btn.grid(
+            row=btn_row + 4, column=0, columnspan=3, sticky="ew", pady=2
+        )
 
         ttk.Label(panel, textvariable=self.status_var, wraplength=180).grid(
-            row=btn_row + 4, column=0, columnspan=3, sticky="w", pady=(12, 0)
+            row=btn_row + 5, column=0, columnspan=3, sticky="w", pady=(12, 0)
         )
 
     def _build_plot(self):
@@ -274,6 +576,7 @@ class ScanGUI:
         self.launch_btn.configure(state="disabled")
         self.launch_jog_btn.configure(state="disabled")
         self.home_btn.configure(state="disabled")
+        self.manual_control_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_var.set(
             "Starting jog scan..." if scan_mode == "jog" else "Starting scan..."
@@ -355,6 +658,7 @@ class ScanGUI:
         self.launch_btn.configure(state="disabled")
         self.launch_jog_btn.configure(state="disabled")
         self.home_btn.configure(state="disabled")
+        self.manual_control_btn.configure(state="disabled")
         self.status_var.set("Homing motors...")
 
         def worker_fn():
@@ -380,6 +684,35 @@ class ScanGUI:
 
         self.worker = threading.Thread(target=worker_fn, daemon=True)
         self.worker.start()
+
+    def _on_manual_control(self):
+        if self.manual_window is not None:
+            return
+        if self.worker is not None and self.worker.is_alive():
+            return
+        self.launch_btn.configure(state="disabled")
+        self.launch_jog_btn.configure(state="disabled")
+        self.home_btn.configure(state="disabled")
+        self.manual_control_btn.configure(state="disabled")
+        defaults = {
+            "x0": self.fields["x0"].get(),
+            "y0": self.fields["y0"].get(),
+            "acceleration": self.fields["acceleration"].get(),
+            "max_velocity": self.fields["max_velocity"].get(),
+        }
+        self.manual_window = ManualControlWindow(
+            self.root,
+            serial=SERIAL,
+            defaults=defaults,
+            on_close=self._on_manual_control_closed,
+        )
+
+    def _on_manual_control_closed(self):
+        self.manual_window = None
+        self.launch_btn.configure(state="normal")
+        self.launch_jog_btn.configure(state="normal")
+        self.home_btn.configure(state="normal")
+        self.manual_control_btn.configure(state="normal")
 
     def _on_load(self):
         path = filedialog.askopenfilename(
@@ -428,6 +761,7 @@ class ScanGUI:
                     self.launch_btn.configure(state="normal")
                     self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
+                    self.manual_control_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                 elif kind == "error":
                     _, error_text = message
@@ -436,12 +770,14 @@ class ScanGUI:
                     self.launch_btn.configure(state="normal")
                     self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
+                    self.manual_control_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                 elif kind == "home_done":
                     self.status_var.set("Homing complete.")
                     self.launch_btn.configure(state="normal")
                     self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
+                    self.manual_control_btn.configure(state="normal")
                 elif kind == "home_error":
                     _, error_text = message
                     self.status_var.set(f"Homing failed: {error_text}")
@@ -449,6 +785,7 @@ class ScanGUI:
                     self.launch_btn.configure(state="normal")
                     self.launch_jog_btn.configure(state="normal")
                     self.home_btn.configure(state="normal")
+                    self.manual_control_btn.configure(state="normal")
         except queue.Empty:
             pass
 
@@ -596,6 +933,8 @@ class ScanGUI:
     def _on_close(self):
         if self.stop_event is not None:
             self.stop_event.set()
+        if self.manual_window is not None:
+            self.manual_window.close()
         self._render_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
