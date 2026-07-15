@@ -41,6 +41,7 @@ from ThorlabsStepper import ThorlabsModularStepperController
 from ThorlabsNanoTrak import ThorlabsModularNanoTrak
 
 SERIAL = "50865380"
+NANOTRAK_SERIAL = "52849313"
 ARDUINO_PORT = "COM3"
 ARDUINO_BAUD = 230400
 SAVE_FILE = "scan_last.npz"
@@ -403,8 +404,9 @@ class ManualControlWindow:
 class NanoTrakControlWindow:
     """Manual piezo and automatic tracking controls for the rack NanoTrak."""
 
-    def __init__(self, master, serial, defaults, on_close):
+    def __init__(self, master, serial, nanotrak_serial, defaults, on_close):
         self.serial = serial
+        self.nanotrak_serial = nanotrak_serial
         self.defaults = defaults
         self.on_close = on_close
         self.controller = None
@@ -672,7 +674,7 @@ class NanoTrakControlWindow:
                 return
             try:
                 if name == "connect":
-                    self.controller = ThorlabsModularNanoTrak(self.serial, poll_ms=50)
+                    self.controller = ThorlabsModularNanoTrak(self.nanotrak_serial, poll_ms=50)
                     self.controller.connect()
                     self.motorx = ThorlabsModularStepperController(
                         serial=self.serial,
@@ -1231,6 +1233,7 @@ class ScanGUI:
         self.nanotrak_window = NanoTrakControlWindow(
             self.root,
             serial=SERIAL,
+            nanotrak_serial=NANOTRAK_SERIAL,
             defaults=defaults,
             on_close=self._on_nanotrak_control_closed,
         )
