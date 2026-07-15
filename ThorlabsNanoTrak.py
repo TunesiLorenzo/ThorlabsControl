@@ -15,7 +15,7 @@ from ctypes import (
     c_ushort,
 )
 
-from ThorlabsStepper import KINESIS_DIR, ThorlabsError, check_zero
+from ThorlabsStepper import KINESIS_DIR, ThorlabsError, check_zero, ensure_device_list
 
 
 class NT_HVComponent(Structure):
@@ -59,6 +59,7 @@ class ThorlabsModularNanoTrak:
         self.poll_ms = int(poll_ms)
         self.dll = None
         self._opened = False
+        self._rack_opened = False
         self._polling = False
         self._load_dlls()
 
@@ -80,6 +81,10 @@ class ThorlabsModularNanoTrak:
 
         dll.TLI_BuildDeviceList.restype = c_short
         dll.TLI_BuildDeviceList.argtypes = []
+        dll.MMR_Open.restype = c_short
+        dll.MMR_Open.argtypes = [c_char_p]
+        dll.MMR_Close.restype = None
+        dll.MMR_Close.argtypes = [c_char_p]
         dll.NT_Open.restype = c_short
         dll.NT_Open.argtypes = [c_char_p]
         dll.NT_Close.restype = None
@@ -117,7 +122,9 @@ class ThorlabsModularNanoTrak:
         self.dll = dll
 
     def connect(self):
-        check_zero(self.dll.TLI_BuildDeviceList(), "TLI_BuildDeviceList")
+        ensure_device_list(self.dll)
+        check_zero(self.dll.MMR_Open(self.serial), "MMR_Open")
+        self._rack_opened = True
         check_zero(self.dll.NT_Open(self.serial), "NT_Open")
         self._opened = True
         for channel in (1, 2):
@@ -125,10 +132,17 @@ class ThorlabsModularNanoTrak:
                 self.dll.NT_ChannelEnable(self.serial, channel, True),
                 f"NT_ChannelEnable(channel={channel})",
             )
-        check_zero(self.dll.NT_RequestSettings(self.serial), "NT_RequestSettings")
         if not self.dll.NT_StartPolling(self.serial, self.poll_ms):
             raise ThorlabsError("NT_StartPolling failed")
         self._polling = True
+        # NT_RequestSettings is deliberately not called here: on this
+        # modular-rack-hosted NanoTrak card (model MNA601) it always fails
+        # with FT_InvalidHandle even though every other call -- including
+        # NT_GetHardwareInfo, NT_ChannelEnable, and live position/mode
+        # requests -- works fine, both before and after polling starts.
+        # It isn't needed anyway: NT_RequestCirclePosition/NT_RequestMode
+        # (used by get_position_percent/get_mode below) fetch live values
+        # from the device directly without it.
         time.sleep(max(0.1, self.poll_ms / 1000.0))
 
     def disconnect(self):
@@ -138,6 +152,9 @@ class ThorlabsModularNanoTrak:
         if self._opened:
             self.dll.NT_Close(self.serial)
             self._opened = False
+        if self._rack_opened:
+            self.dll.MMR_Close(self.serial)
+            self._rack_opened = False
 
     def safe_shutdown(self):
         try:

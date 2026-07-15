@@ -25,6 +25,27 @@ class ThorlabsError(RuntimeError):
     pass
 
 
+_device_list_built = False
+
+
+def ensure_device_list(dll):
+    """
+    Rebuild Kinesis's process-wide device list at most once per process.
+
+    TLI_BuildDeviceList() resets the DLL's internal device registry for
+    every open handle in the process, not just the caller's. Calling it
+    again after another device (e.g. a NanoTrak module opened via a
+    different controller instance) has already been opened orphans that
+    device's handle -- its next call fails with FT_InvalidHandle even
+    though nothing about that device changed. So this must only run once,
+    before any device in the process is opened.
+    """
+    global _device_list_built
+    if not _device_list_built:
+        check_zero(dll.TLI_BuildDeviceList(), "TLI_BuildDeviceList")
+        _device_list_built = True
+
+
 def check_zero(result, name):
     if result != 0:
         raise ThorlabsError(f"{name} failed with error code {result}")
@@ -227,7 +248,7 @@ class ThorlabsModularStepperController:
     # Connection lifecycle
     # ------------------------------------------------------------------
     def connect(self):
-        check_zero(self.dll.TLI_BuildDeviceList(), "TLI_BuildDeviceList")
+        ensure_device_list(self.dll)
         check_zero(self.dll.MMR_Open(self.serial), "MMR_Open")
         self._opened = True
 
