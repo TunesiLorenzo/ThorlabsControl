@@ -108,12 +108,10 @@ class CircularActionButton(tk.Canvas):
 
 class ManualControlWindow:
     """
-    Standalone window for jogging/positioning the X/Y stage outside of a
-    scan. Owns its own motor connections (opened on init, closed on
-    close), so the caller must keep this mutually exclusive with a live
-    scan or the homing routine -- see ScanGUI._on_manual_control /
-    _on_manual_control_closed, which disable each side's launch buttons
-    while the other is active.
+    Controls for jogging/positioning the X/Y stage outside of a scan. The UI
+    can be hosted in a standalone window or embedded in the main notebook.
+    It owns its motor connections, so ScanGUI disconnects it before a scan
+    or homing operation takes ownership of the stage.
 
     All Kinesis calls happen on a single dedicated worker thread (commands
     pushed through self._command_queue, results read back through
@@ -124,7 +122,7 @@ class ManualControlWindow:
     immediately even while a move is in flight on the worker thread.
     """
 
-    def __init__(self, master, serial, defaults, on_close):
+    def __init__(self, master, serial, defaults, on_close=None, embedded=False):
         self.serial = serial
         self.on_close = on_close
         self._result_queue = queue.Queue()
@@ -133,9 +131,13 @@ class ManualControlWindow:
         self.motory = None
         self._closed = False
 
-        self.top = tk.Toplevel(master)
-        self.top.title("Manual XY Control")
-        self.top.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        self._embedded = embedded
+        if embedded:
+            self.top = master
+        else:
+            self.top = tk.Toplevel(master)
+            self.top.title("Manual XY Control")
+            self.top.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
         self.status_var = tk.StringVar(value="Connecting...")
         self.x_pos_var = tk.StringVar(value="--")
@@ -385,15 +387,18 @@ class ManualControlWindow:
 
     # ------------------------------------------------------------- closing
 
-    def close(self):
+    def close(self, wait=False):
         if self._closed:
             return
         self._closed = True
         self._command_queue.put(("shutdown",))
-        try:
-            self.top.destroy()
-        except tk.TclError:
-            pass
+        if wait and threading.current_thread() is not self._worker:
+            self._worker.join()
+        if not self._embedded:
+            try:
+                self.top.destroy()
+            except tk.TclError:
+                pass
 
     def _on_window_close(self):
         self.close()
@@ -402,13 +407,24 @@ class ManualControlWindow:
 
 
 class NanoTrakControlWindow:
-    """Manual piezo and automatic tracking controls for the rack NanoTrak."""
+    """Embeddable manual piezo and automatic rack NanoTrak controls."""
 
-    def __init__(self, master, serial, nanotrak_serial, defaults, on_close):
+    def __init__(
+        self,
+        master,
+        serial,
+        nanotrak_serial,
+        defaults,
+        on_close=None,
+        embedded=False,
+        include_motor_controls=True,
+    ):
         self.serial = serial
         self.nanotrak_serial = nanotrak_serial
         self.defaults = defaults
         self.on_close = on_close
+        self._embedded = embedded
+        self.include_motor_controls = include_motor_controls
         self.controller = None
         self.motorx = None
         self.motory = None
@@ -419,9 +435,12 @@ class NanoTrakControlWindow:
         self._command_queue = queue.Queue()
         self._result_queue = queue.Queue()
 
-        self.top = tk.Toplevel(master)
-        self.top.title("Piezo / Auto Track")
-        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        if embedded:
+            self.top = master
+        else:
+            self.top = tk.Toplevel(master)
+            self.top.title("Piezo / Auto Track")
+            self.top.protocol("WM_DELETE_WINDOW", self.close)
 
         self.h_var = tk.StringVar(value="--")
         self.v_var = tk.StringVar(value="--")
@@ -557,6 +576,8 @@ class NanoTrakControlWindow:
             )
             button.grid(row=row, column=column, padx=4, pady=3)
             self.motor_jog_buttons.append(button)
+        if not self.include_motor_controls:
+            motors.grid_remove()
 
         ttk.Label(frame, textvariable=self.status_var, wraplength=360).grid(
             row=6, column=0, sticky="w"
@@ -568,7 +589,7 @@ class NanoTrakControlWindow:
             self.clear_trace_btn,
             *self.jog_buttons,
             *self.mode_buttons,
-            *self.motor_jog_buttons,
+            *(self.motor_jog_buttons if self.include_motor_controls else []),
         ]
         self._set_controls_enabled(False)
 
@@ -676,34 +697,36 @@ class NanoTrakControlWindow:
                 if name == "connect":
                     self.controller = ThorlabsModularNanoTrak(self.nanotrak_serial, poll_ms=50)
                     self.controller.connect()
-                    self.motorx = ThorlabsModularStepperController(
-                        serial=self.serial,
-                        channel=1,
-                        kinesis_dir=self.controller.kinesis_dir,
-                        poll_ms=50,
-                    )
-                    self.motory = ThorlabsModularStepperController(
-                        serial=self.serial,
-                        channel=2,
-                        kinesis_dir=self.controller.kinesis_dir,
-                        poll_ms=50,
-                    )
-                    self.motorx.connect()
-                    self.motory.connect()
-                    try:
-                        acceleration = float(self.defaults.get("acceleration", "4.0"))
-                        max_velocity = float(self.defaults.get("max_velocity", "4.0"))
-                        self.motorx.set_velocity_params(
-                            acceleration, max_velocity, real_unit=True
+                    if self.include_motor_controls:
+                        self.motorx = ThorlabsModularStepperController(
+                            serial=self.serial,
+                            channel=1,
+                            kinesis_dir=self.controller.kinesis_dir,
+                            poll_ms=50,
                         )
-                        self.motory.set_velocity_params(
-                            acceleration, max_velocity, real_unit=True
+                        self.motory = ThorlabsModularStepperController(
+                            serial=self.serial,
+                            channel=2,
+                            kinesis_dir=self.controller.kinesis_dir,
+                            poll_ms=50,
                         )
-                    except ValueError:
-                        pass
+                        self.motorx.connect()
+                        self.motory.connect()
+                        try:
+                            acceleration = float(self.defaults.get("acceleration", "4.0"))
+                            max_velocity = float(self.defaults.get("max_velocity", "4.0"))
+                            self.motorx.set_velocity_params(
+                                acceleration, max_velocity, real_unit=True
+                            )
+                            self.motory.set_velocity_params(
+                                acceleration, max_velocity, real_unit=True
+                            )
+                        except ValueError:
+                            pass
                     self._connected = True
                     self._result_queue.put(("connected",))
-                    self._push_motor_positions()
+                    if self.include_motor_controls:
+                        self._push_motor_positions()
                 elif name == "set_position":
                     self.controller.set_position_percent(command[1], command[2])
                 elif name == "jog":
@@ -825,20 +848,24 @@ class NanoTrakControlWindow:
             pass
         self.top.after(150, self._poll_queue)
 
-    def close(self):
+    def close(self, wait=False):
         if self._closing or self._closed:
             return
         self._closing = True
         self.status_var.set("Disconnecting...")
         self._set_controls_enabled(False)
         self._command_queue.put(("shutdown",))
+        if wait and threading.current_thread() is not self._worker:
+            self._worker.join()
+            self._finish_close()
 
     def _finish_close(self):
         self._closed = True
-        try:
-            self.top.destroy()
-        except tk.TclError:
-            pass
+        if not self._embedded:
+            try:
+                self.top.destroy()
+            except tk.TclError:
+                pass
         if self.on_close is not None:
             self.on_close()
 
@@ -867,16 +894,29 @@ class ScanGUI:
         self.view_mode = tk.StringVar(value="heatmap")
         self.status_var = tk.StringVar(value="Idle.")
 
-        self._build_controls()
-        self._build_plot()
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        self.scan_tab = ttk.Frame(self.notebook)
+        self.manual_tab = ttk.Frame(self.notebook)
+        self.nanotrak_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.scan_tab, text="Scan")
+        self.notebook.add(self.manual_tab, text="Manual Control")
+        self.notebook.add(self.nanotrak_tab, text="Piezo / Auto Track")
+
+        self._build_controls(self.scan_tab)
+        self._build_plot(self.scan_tab)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(REDRAW_INTERVAL_MS, self._poll_queue)
 
     # ---------------------------------------------------------------- UI
 
-    def _build_controls(self):
-        panel = ttk.Frame(self.root, padding=10)
+    def _build_controls(self, master):
+        panel = ttk.Frame(master, padding=10)
         panel.grid(row=0, column=0, sticky="ns")
 
         field_defs = [
@@ -937,13 +977,17 @@ class ScanGUI:
         btn_row = view_row + 4
         launch_frame = ttk.Frame(panel)
         launch_frame.grid(row=btn_row, column=0, columnspan=3, sticky="ew", pady=(12, 2))
-        launch_frame.columnconfigure((0, 1), weight=1)
+        launch_frame.columnconfigure((0, 1, 2), weight=1)
         self.launch_btn = ttk.Button(launch_frame, text="Launch Scan", command=self._on_launch)
         self.launch_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2))
         self.launch_jog_btn = ttk.Button(
-            launch_frame, text="Launch Jog", command=self._on_launch_jog
+            launch_frame, text="Jog X", command=self._on_launch_jog
         )
-        self.launch_jog_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        self.launch_jog_btn.grid(row=0, column=1, sticky="ew", padx=2)
+        self.launch_y_jog_btn = ttk.Button(
+            launch_frame, text="Jog Y", command=self._on_launch_y_jog
+        )
+        self.launch_y_jog_btn.grid(row=0, column=2, sticky="ew", padx=(2, 0))
         self.stop_btn = ttk.Button(panel, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.grid(row=btn_row + 1, column=0, columnspan=3, sticky="ew", pady=2)
         ttk.Button(
@@ -953,28 +997,15 @@ class ScanGUI:
         self.home_btn.grid(
             row=btn_row + 3, column=0, columnspan=3, sticky="ew", pady=2
         )
-        self.manual_control_btn = ttk.Button(
-            panel, text="Manual Control...", command=self._on_manual_control
-        )
-        self.manual_control_btn.grid(
-            row=btn_row + 4, column=0, columnspan=3, sticky="ew", pady=2
-        )
-        self.nanotrak_control_btn = ttk.Button(
-            panel, text="Piezo / Auto Track...", command=self._on_nanotrak_control
-        )
-        self.nanotrak_control_btn.grid(
-            row=btn_row + 5, column=0, columnspan=3, sticky="ew", pady=2
-        )
-
         ttk.Label(panel, textvariable=self.status_var, wraplength=180).grid(
-            row=btn_row + 6, column=0, columnspan=3, sticky="w", pady=(12, 0)
+            row=btn_row + 4, column=0, columnspan=3, sticky="w", pady=(12, 0)
         )
 
-    def _build_plot(self):
-        plot_frame = ttk.Frame(self.root)
+    def _build_plot(self, master):
+        plot_frame = ttk.Frame(master)
         plot_frame.grid(row=0, column=1, sticky="nsew")
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        master.columnconfigure(1, weight=1)
+        master.rowconfigure(0, weight=1)
 
         self.figure = Figure(figsize=(6, 5))
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
@@ -1007,6 +1038,13 @@ class ScanGUI:
         except ValueError:
             return DEFAULT_MAX_GRID_POINTS
 
+    def _set_jog_buttons_state(self, state):
+        self.launch_jog_btn.configure(state=state)
+        self.launch_y_jog_btn.configure(state=state)
+
+    def _set_manual_tab_enabled(self, enabled):
+        self.notebook.tab(self.manual_tab, state="normal" if enabled else "disabled")
+
     # ------------------------------------------------------------ actions
 
     def _on_launch(self):
@@ -1014,7 +1052,11 @@ class ScanGUI:
 
     def _on_launch_jog(self):
         self.view_mode.set("lines")
-        self._start_scan("jog")
+        self._start_scan("jog_x")
+
+    def _on_launch_y_jog(self):
+        self.view_mode.set("lines")
+        self._start_scan("jog_y")
 
     def _start_scan(self, scan_mode):
         if self.worker is not None and self.worker.is_alive():
@@ -1031,14 +1073,15 @@ class ScanGUI:
         self._render_future = None  # abandon any in-flight render of the old scan
         self.stop_event = threading.Event()
         self.launch_btn.configure(state="disabled")
-        self.launch_jog_btn.configure(state="disabled")
+        self._set_jog_buttons_state("disabled")
         self.home_btn.configure(state="disabled")
-        self.manual_control_btn.configure(state="disabled")
+        self._set_manual_tab_enabled(False)
         self.current_position_btn.configure(state="disabled")
-        self.nanotrak_control_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_var.set(
-            "Starting jog scan..." if scan_mode == "jog" else "Starting scan..."
+            f"Starting {scan_mode[-1].upper()} jog scan..."
+            if scan_mode.startswith("jog_")
+            else "Starting scan..."
         )
 
         def progress_callback(row_dict, row_index, total_rows):
@@ -1046,15 +1089,20 @@ class ScanGUI:
 
         def worker_fn():
             try:
-                if scan_mode == "jog":
+                if scan_mode.startswith("jog_"):
+                    jog_axis = scan_mode[-1]
                     scan_rows = run_jog_scan(
                         serial=SERIAL,
                         arduino_port=ARDUINO_PORT,
                         arduino_baud=ARDUINO_BAUD,
                         x0=params["x0"],
                         y0=params["y0"],
-                        x_span=params["x_span"],
-                        jog_spacing=params["jog_spacing"],
+                        x_span=params["x_span"] if jog_axis == "x" else params["y_span"],
+                        jog_spacing=(
+                            params["jog_spacing"]
+                            if jog_axis == "x"
+                            else params["line_spacing"]
+                        ),
                         acceleration=params["acceleration"],
                         max_velocity=params["max_velocity"],
                         sample_duration_s=JOG_SAMPLE_DURATION_S,
@@ -1062,6 +1110,7 @@ class ScanGUI:
                         save_file=SAVE_FILE,
                         progress_callback=progress_callback,
                         stop_event=self.stop_event,
+                        axis=jog_axis,
                     )
                 else:
                     scan_rows = run_scan(
@@ -1115,11 +1164,10 @@ class ScanGUI:
         if self.worker is not None and self.worker.is_alive():
             return
         self.launch_btn.configure(state="disabled")
-        self.launch_jog_btn.configure(state="disabled")
+        self._set_jog_buttons_state("disabled")
         self.home_btn.configure(state="disabled")
-        self.manual_control_btn.configure(state="disabled")
+        self._set_manual_tab_enabled(False)
         self.current_position_btn.configure(state="disabled")
-        self.nanotrak_control_btn.configure(state="disabled")
         self.status_var.set("Reading motor positions...")
 
         def worker_fn():
@@ -1149,11 +1197,10 @@ class ScanGUI:
         if self.worker is not None and self.worker.is_alive():
             return
         self.launch_btn.configure(state="disabled")
-        self.launch_jog_btn.configure(state="disabled")
+        self._set_jog_buttons_state("disabled")
         self.home_btn.configure(state="disabled")
-        self.manual_control_btn.configure(state="disabled")
+        self._set_manual_tab_enabled(False)
         self.current_position_btn.configure(state="disabled")
-        self.nanotrak_control_btn.configure(state="disabled")
         self.status_var.set("Homing motors...")
 
         def worker_fn():
@@ -1180,17 +1227,19 @@ class ScanGUI:
         self.worker = threading.Thread(target=worker_fn, daemon=True)
         self.worker.start()
 
-    def _on_manual_control(self):
-        if self.manual_window is not None:
-            return
+    def _on_tab_changed(self, _event=None):
+        selected = self.notebook.select()
+        if selected == str(self.scan_tab):
+            self._deactivate_manual_control()
+        elif selected == str(self.manual_tab) and self.manual_window is None:
+            self._activate_manual_control()
+        elif selected == str(self.nanotrak_tab) and self.nanotrak_window is None:
+            self._activate_nanotrak_control()
+
+    def _activate_manual_control(self):
         if self.worker is not None and self.worker.is_alive():
+            self.notebook.select(self.scan_tab)
             return
-        self.launch_btn.configure(state="disabled")
-        self.launch_jog_btn.configure(state="disabled")
-        self.home_btn.configure(state="disabled")
-        self.manual_control_btn.configure(state="disabled")
-        self.current_position_btn.configure(state="disabled")
-        self.nanotrak_control_btn.configure(state="disabled")
         defaults = {
             "x0": self.fields["x0"].get(),
             "y0": self.fields["y0"].get(),
@@ -1198,54 +1247,32 @@ class ScanGUI:
             "max_velocity": self.fields["max_velocity"].get(),
         }
         self.manual_window = ManualControlWindow(
-            self.root,
+            self.manual_tab,
             serial=SERIAL,
             defaults=defaults,
-            on_close=self._on_manual_control_closed,
+            embedded=True,
         )
 
-    def _on_manual_control_closed(self):
+    def _deactivate_manual_control(self):
+        if self.manual_window is None:
+            return
+        self.manual_window.close(wait=True)
         self.manual_window = None
-        self.launch_btn.configure(state="normal")
-        self.launch_jog_btn.configure(state="normal")
-        self.home_btn.configure(state="normal")
-        self.manual_control_btn.configure(state="normal")
-        self.current_position_btn.configure(state="normal")
-        self.nanotrak_control_btn.configure(state="normal")
+        for child in self.manual_tab.winfo_children():
+            child.destroy()
 
-    def _on_nanotrak_control(self):
-        if self.nanotrak_window is not None:
-            return
-        if self.worker is not None and self.worker.is_alive():
-            return
-        if self.manual_window is not None:
-            return
-        self.launch_btn.configure(state="disabled")
-        self.launch_jog_btn.configure(state="disabled")
-        self.home_btn.configure(state="disabled")
-        self.manual_control_btn.configure(state="disabled")
-        self.current_position_btn.configure(state="disabled")
-        self.nanotrak_control_btn.configure(state="disabled")
-        defaults = {
-            "acceleration": self.fields["acceleration"].get(),
-            "max_velocity": self.fields["max_velocity"].get(),
-        }
+    def _activate_nanotrak_control(self):
         self.nanotrak_window = NanoTrakControlWindow(
-            self.root,
+            self.nanotrak_tab,
             serial=SERIAL,
             nanotrak_serial=NANOTRAK_SERIAL,
-            defaults=defaults,
-            on_close=self._on_nanotrak_control_closed,
+            defaults={
+                "acceleration": self.fields["acceleration"].get(),
+                "max_velocity": self.fields["max_velocity"].get(),
+            },
+            embedded=True,
+            include_motor_controls=False,
         )
-
-    def _on_nanotrak_control_closed(self):
-        self.nanotrak_window = None
-        self.launch_btn.configure(state="normal")
-        self.launch_jog_btn.configure(state="normal")
-        self.home_btn.configure(state="normal")
-        self.manual_control_btn.configure(state="normal")
-        self.current_position_btn.configure(state="normal")
-        self.nanotrak_control_btn.configure(state="normal")
 
     def _on_load(self):
         path = filedialog.askopenfilename(
@@ -1292,41 +1319,37 @@ class ScanGUI:
                     self.dirty = True
                     self.status_var.set(f"Scan finished: {len(scan_rows)} row(s).")
                     self.launch_btn.configure(state="normal")
-                    self.launch_jog_btn.configure(state="normal")
+                    self._set_jog_buttons_state("normal")
                     self.home_btn.configure(state="normal")
-                    self.manual_control_btn.configure(state="normal")
+                    self._set_manual_tab_enabled(True)
                     self.current_position_btn.configure(state="normal")
-                    self.nanotrak_control_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                 elif kind == "error":
                     _, error_text = message
                     self.status_var.set(f"Scan failed: {error_text}")
                     messagebox.showerror("Scan failed", error_text)
                     self.launch_btn.configure(state="normal")
-                    self.launch_jog_btn.configure(state="normal")
+                    self._set_jog_buttons_state("normal")
                     self.home_btn.configure(state="normal")
-                    self.manual_control_btn.configure(state="normal")
+                    self._set_manual_tab_enabled(True)
                     self.current_position_btn.configure(state="normal")
-                    self.nanotrak_control_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                 elif kind == "home_done":
                     self.status_var.set("Homing complete.")
                     self.launch_btn.configure(state="normal")
-                    self.launch_jog_btn.configure(state="normal")
+                    self._set_jog_buttons_state("normal")
                     self.home_btn.configure(state="normal")
-                    self.manual_control_btn.configure(state="normal")
+                    self._set_manual_tab_enabled(True)
                     self.current_position_btn.configure(state="normal")
-                    self.nanotrak_control_btn.configure(state="normal")
                 elif kind == "home_error":
                     _, error_text = message
                     self.status_var.set(f"Homing failed: {error_text}")
                     messagebox.showerror("Homing failed", error_text)
                     self.launch_btn.configure(state="normal")
-                    self.launch_jog_btn.configure(state="normal")
+                    self._set_jog_buttons_state("normal")
                     self.home_btn.configure(state="normal")
-                    self.manual_control_btn.configure(state="normal")
+                    self._set_manual_tab_enabled(True)
                     self.current_position_btn.configure(state="normal")
-                    self.nanotrak_control_btn.configure(state="normal")
                 elif kind == "position_done":
                     _, x, y = message
                     self.fields["x0"].set(f"{x:.9g}")
@@ -1335,21 +1358,19 @@ class ScanGUI:
                         f"Center set to current position: X={x:.6g} mm, Y={y:.6g} mm."
                     )
                     self.launch_btn.configure(state="normal")
-                    self.launch_jog_btn.configure(state="normal")
+                    self._set_jog_buttons_state("normal")
                     self.home_btn.configure(state="normal")
-                    self.manual_control_btn.configure(state="normal")
+                    self._set_manual_tab_enabled(True)
                     self.current_position_btn.configure(state="normal")
-                    self.nanotrak_control_btn.configure(state="normal")
                 elif kind == "position_error":
                     _, error_text = message
                     self.status_var.set(f"Position read failed: {error_text}")
                     messagebox.showerror("Position read failed", error_text)
                     self.launch_btn.configure(state="normal")
-                    self.launch_jog_btn.configure(state="normal")
+                    self._set_jog_buttons_state("normal")
                     self.home_btn.configure(state="normal")
-                    self.manual_control_btn.configure(state="normal")
+                    self._set_manual_tab_enabled(True)
                     self.current_position_btn.configure(state="normal")
-                    self.nanotrak_control_btn.configure(state="normal")
         except queue.Empty:
             pass
 
@@ -1398,6 +1419,15 @@ class ScanGUI:
             return ("empty",)
 
         if view_mode == "lines":
+            if all(row.get("jog_axis") == "y" for row in scan_rows):
+                points = [
+                    (row["y"], row["samples"][0])
+                    for row in scan_rows
+                    if row["samples"]
+                ]
+                positions = np.asarray([point[0] for point in points], dtype=float)
+                samples = np.asarray([point[1] for point in points], dtype=float)
+                return ("axis_line", "Y", positions, samples)
             lines = build_scan_lines_incremental(scan_rows, self._grid_cache)
             return ("lines", lines)
 
@@ -1427,6 +1457,16 @@ class ScanGUI:
 
         if kind == "lines":
             self._plot_lines(payload[1])
+            return
+
+        if kind == "axis_line":
+            _, axis_name, positions, samples = payload
+            ax = self.figure.add_subplot(111)
+            ax.plot(positions, samples, linewidth=1.0, marker=".")
+            ax.set_xlabel(f"{axis_name} position (mm)")
+            ax.set_ylabel("ADC count")
+            ax.grid(True)
+            self.canvas.draw_idle()
             return
 
         _, view_mode, x_grid, y_grid, z = payload
@@ -1498,9 +1538,9 @@ class ScanGUI:
         if self.stop_event is not None:
             self.stop_event.set()
         if self.manual_window is not None:
-            self.manual_window.close()
+            self.manual_window.close(wait=True)
         if self.nanotrak_window is not None:
-            self.nanotrak_window.close()
+            self.nanotrak_window.close(wait=True)
         self._render_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 

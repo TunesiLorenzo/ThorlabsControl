@@ -701,24 +701,29 @@ def run_jog_scan(
     save_file=None,
     progress_callback=None,
     stop_event=None,
+    axis="x",
 ):
     """
-    Fine-alignment single-line scan: step X across ``x_span`` in
-    ``jog_spacing`` increments at the fixed Y position ``y0``, sampling the
-    detector at each stopped point.
+    Fine-alignment single-line scan along X or Y, sampling the detector at
+    each stopped point. ``x_span`` and ``jog_spacing`` describe the selected
+    axis; their historical names are retained for API compatibility.
 
-    Each X jog finishes before its position is read and the detector is
+    Each jog finishes before its position is read and the detector is
     sampled -- the ADC bytes collected during ``sample_duration_s`` are
     averaged into one value at that explicit measured X position. Intended
     for fine-tuning around a line already located with a coarser raster
     scan, not for surveying a 2D area.
     """
+    axis = str(axis).lower()
+    if axis not in ("x", "y"):
+        raise ValueError("axis must be 'x' or 'y'")
     if jog_spacing <= 0:
         raise ValueError("jog_spacing must be positive")
     if sample_duration_s <= 0:
         raise ValueError("sample_duration_s must be positive")
 
-    x_points = build_axis_points(x0 - x_span / 2, x_span, jog_spacing)
+    center = x0 if axis == "x" else y0
+    points = build_axis_points(center - x_span / 2, x_span, jog_spacing)
     scan_rows = []
 
     motorx = None
@@ -747,70 +752,98 @@ def run_jog_scan(
                 max_velocity=max_velocity,
                 real_unit=True,
             )
-        motorx.set_jog_mode(continuous=False, profiled_stop=True)
-        motorx.set_jog_velocity_params(
+        jog_motor = motorx if axis == "x" else motory
+        jog_motor.set_jog_mode(continuous=False, profiled_stop=True)
+        jog_motor.set_jog_velocity_params(
             acceleration=acceleration,
             max_velocity=max_velocity,
             real_unit=True,
         )
 
-        motorx.move_absolute(x_points[0], wait=True, real_unit=True)
-        motory.move_absolute(y0, wait=True, real_unit=True)
+        motorx.move_absolute(points[0] if axis == "x" else x0, wait=True, real_unit=True)
+        motory.move_absolute(points[0] if axis == "y" else y0, wait=True, real_unit=True)
         ser = open_arduino(port=arduino_port, baud=arduino_baud)
 
+        actual_x = motorx.get_position(real_unit=True)
         actual_y = motory.get_position(real_unit=True)
+        fixed_axis = "Y" if axis == "x" else "X"
+        fixed_position = actual_y if axis == "x" else actual_x
         print(
-            f"Jog line scanning {len(x_points)} point(s) at y={actual_y:.6f}; "
-            f"X spacing={jog_spacing:.6g} mm, sample={sample_duration_s:.3f}s/point."
+            f"{axis.upper()} jog line scanning {len(points)} point(s) at "
+            f"{fixed_axis.lower()}={fixed_position:.6f}; {axis.upper()} "
+            f"spacing={jog_spacing:.6g} mm, sample={sample_duration_s:.3f}s/point."
         )
 
         row_x_positions = []
         row_samples = []
 
-        for point_index, target in enumerate(x_points):
+        for point_index, target in enumerate(points):
             if stop_event is not None and stop_event.is_set():
                 print("Jog scan stopped at a completed sample point (requested).")
                 break
 
             if point_index > 0:
-                step = target - x_points[point_index - 1]
-                motorx.set_jog_step_size(abs(step), real_unit=True)
+                step = target - points[point_index - 1]
+                jog_motor.set_jog_step_size(abs(step), real_unit=True)
                 if step >= 0:
-                    motorx.jog_forward(wait=True)
+                    jog_motor.jog_forward(wait=True)
                 else:
-                    motorx.jog_backward(wait=True)
+                    jog_motor.jog_backward(wait=True)
 
             actual_x = motorx.get_position(real_unit=True)
+            actual_y = motory.get_position(real_unit=True)
             raw_samples = burst_read_binary(
                 ser=ser,
                 duration=sample_duration_s,
                 reset_buffer=True,
             )
             value = float(np.mean(raw_samples)) if raw_samples else float("nan")
-            row_x_positions.append(actual_x)
-            row_samples.append(value)
-
-            row = {
-                "scan_mode": "jog_line",
-                "row": 0,
-                "y": actual_y,
-                "x_start": row_x_positions[0],
-                "x_end": row_x_positions[-1],
-                "x_displacement": row_x_positions[-1] - row_x_positions[0],
-                "x_positions": list(row_x_positions),
-                "jog_spacing": jog_spacing,
-                "sample_duration_s": sample_duration_s,
-                "acceleration": acceleration,
-                "max_velocity": max_velocity,
-                "samples": list(row_samples),
-            }
-            scan_rows = [row]
+            if axis == "x":
+                row_x_positions.append(actual_x)
+                row_samples.append(value)
+                row = {
+                    "scan_mode": "jog_line",
+                    "jog_axis": axis,
+                    "row": 0,
+                    "y": actual_y,
+                    "x_start": row_x_positions[0],
+                    "x_end": row_x_positions[-1],
+                    "x_displacement": row_x_positions[-1] - row_x_positions[0],
+                    "x_positions": list(row_x_positions),
+                    "jog_spacing": jog_spacing,
+                    "sample_duration_s": sample_duration_s,
+                    "acceleration": acceleration,
+                    "max_velocity": max_velocity,
+                    "samples": list(row_samples),
+                }
+                scan_rows = [row]
+                callback_index = 0
+                callback_total = 1
+            else:
+                row = {
+                    "scan_mode": "jog_line_y",
+                    "jog_axis": axis,
+                    "row": point_index,
+                    "y": actual_y,
+                    "x_start": actual_x,
+                    "x_end": actual_x,
+                    "x_displacement": 0.0,
+                    "x_positions": [actual_x],
+                    "jog_spacing": jog_spacing,
+                    "sample_duration_s": sample_duration_s,
+                    "acceleration": acceleration,
+                    "max_velocity": max_velocity,
+                    "samples": [value],
+                }
+                scan_rows.append(row)
+                callback_index = point_index
+                callback_total = len(points)
             print(
-                f"Jog point {point_index + 1}/{len(x_points)}: "
-                f"x={actual_x:.6f}, value={value:.6g}"
+                f"Jog point {point_index + 1}/{len(points)}: "
+                f"{axis}={actual_x if axis == 'x' else actual_y:.6f}, value={value:.6g}"
             )
             if progress_callback is not None:
-                progress_callback(row, 0, 1)
+                progress_callback(row, callback_index, callback_total)
 
         scan_failed = False
 
@@ -831,7 +864,8 @@ def run_jog_scan(
 
     if save_file and scan_rows:
         np.savez(save_file, scan_rows=np.array(scan_rows, dtype=object))
-        print(f"Saved jog line ({len(scan_rows[0]['samples'])} point(s)) to {save_file}")
+        point_count = sum(len(row["samples"]) for row in scan_rows)
+        print(f"Saved jog line ({point_count} point(s)) to {save_file}")
 
     return scan_rows
 

@@ -64,6 +64,12 @@ Hardware access runs on a background thread so the window stays
 responsive; the plot redraws on a timer (not once per row) so a fast scan
 can't flood the UI.
 
+The main window has **Scan**, **Manual Control**, and **Piezo / Auto Track**
+tabs. Manual stage movement and NanoTrak piezo control can remain connected
+and be operated together. Returning to the Scan tab disconnects the manual
+stage worker so scans and homing can take exclusive ownership of the motors;
+the independent piezo controls remain available.
+
 Fields:
 
 - **X/Y center, X/Y span, line spacing** (mm) — scan geometry. The stage
@@ -77,10 +83,10 @@ Fields:
 - **View**: 2D heatmap, 3D surface, or overlaid per-row line plot.
 - The small **⊙** button beside X/Y center sets both center fields to the
   highest sampled point in the current scan.
-- **Launch Scan** runs the continuous X fly scan. **Launch Jog** instead
-  single-step jogs X, waits for each move to finish, reads the actual X
-  position, and averages a stationary ADC burst at that point. This avoids
-  reconstructing X from timing. Rows still step in Y and alternate X direction.
+- **Launch Scan** runs the continuous X fly scan. **Jog X** single-step jogs
+  across X span using X jog spacing. **Jog Y** does the same across Y span
+  using line spacing. Both wait for every move, read the actual position, and
+  average a stationary ADC burst at that point.
 - **Stop** ends a fly scan after its current row, or a jog scan after its
   current sampled point.
 - **Home Motors** homes both axes.
