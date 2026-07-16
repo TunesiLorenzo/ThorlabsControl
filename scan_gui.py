@@ -110,8 +110,9 @@ class ManualControlWindow:
     """
     Controls for jogging/positioning the X/Y stage outside of a scan. The UI
     can be hosted in a standalone window or embedded in the main notebook.
-    It owns its motor connections, so ScanGUI disconnects it before a scan
-    or homing operation takes ownership of the stage.
+    Motors are provided by ScanGUI's shared, persistent connection (see
+    ScanGUI._get_shared_motors) rather than owned by this window -- closing
+    it just stops referencing them, it does not disconnect.
 
     All Kinesis calls happen on a single dedicated worker thread (commands
     pushed through self._command_queue, results read back through
@@ -122,8 +123,8 @@ class ManualControlWindow:
     immediately even while a move is in flight on the worker thread.
     """
 
-    def __init__(self, master, serial, defaults, on_close=None, embedded=False):
-        self.serial = serial
+    def __init__(self, master, get_motors, defaults, on_close=None, embedded=False):
+        self.get_motors = get_motors
         self.on_close = on_close
         self._result_queue = queue.Queue()
         self._command_queue = queue.Queue()
@@ -249,9 +250,9 @@ class ManualControlWindow:
             command = self._command_queue.get()
             name = command[0]
             if name == "shutdown":
-                self._safe_disconnect()
                 return
             try:
+                push_status = True
                 if name == "connect":
                     self._cmd_connect()
                 elif name == "refresh":
@@ -268,10 +269,7 @@ class ManualControlWindow:
                 self._result_queue.put(("error", str(exc)))
 
     def _cmd_connect(self):
-        self.motorx = ThorlabsModularStepperController(serial=self.serial, channel=1, poll_ms=1)
-        self.motory = ThorlabsModularStepperController(serial=self.serial, channel=2, poll_ms=1)
-        self.motorx.connect()
-        self.motory.connect()
+        self.motorx, self.motory = self.get_motors()
         try:
             accel = float(self.accel_var.get())
             max_vel = float(self.vel_var.get())
@@ -300,14 +298,6 @@ class ManualControlWindow:
         x = self.motorx.get_position(real_unit=True)
         y = self.motory.get_position(real_unit=True)
         self._result_queue.put(("position", x, y))
-
-    def _safe_disconnect(self):
-        for motor in (self.motorx, self.motory):
-            if motor is not None:
-                try:
-                    motor.safe_shutdown()
-                except Exception:
-                    pass
 
     # --------------------------------------------------- UI command senders
 
@@ -409,6 +399,14 @@ class ManualControlWindow:
 class NanoTrakControlWindow:
     """Embeddable manual piezo and automatic rack NanoTrak controls."""
 
+    FEEDBACK_LABELS = [
+        ThorlabsModularNanoTrak.FEEDBACK_NAMES[key]
+        for key in sorted(ThorlabsModularNanoTrak.FEEDBACK_NAMES)
+    ]
+    FEEDBACK_BY_LABEL = {
+        label: key for key, label in ThorlabsModularNanoTrak.FEEDBACK_NAMES.items()
+    }
+
     def __init__(
         self,
         master,
@@ -432,6 +430,10 @@ class NanoTrakControlWindow:
         self._closing = False
         self._connected = False
         self._trace = []
+        self._last_position = None
+        self._track_radius_nt = None
+        self._manual_active = False
+        self._feedback_source = ThorlabsModularNanoTrak.FEEDBACK_TIA
         self._command_queue = queue.Queue()
         self._result_queue = queue.Queue()
 
@@ -446,13 +448,20 @@ class NanoTrakControlWindow:
         self.v_var = tk.StringVar(value="--")
         self.target_h_var = tk.StringVar(value="50.0")
         self.target_v_var = tk.StringVar(value="50.0")
-        self.step_var = tk.StringVar(value="0.1")
+        self.track_radius_var = tk.StringVar(value="0.5")
+        self.track_frequency_var = tk.StringVar(value="17.5")
         self.mode_var = tk.StringVar(value="--")
+        self.signal_label_var = tk.StringVar(value="Optical power (PIN/TIA):")
         self.signal_var = tk.StringVar(value="--")
         self.offset_var = tk.StringVar(value="Offset from center: --")
         self.motor_x_var = tk.StringVar(value="--")
         self.motor_y_var = tk.StringVar(value="--")
         self.motor_step_var = tk.StringVar(value="0.01")
+        self.feedback_var = tk.StringVar(value=self.FEEDBACK_LABELS[0])
+        self.chan_a_var = tk.StringVar(value="1")
+        self.chan_b_var = tk.StringVar(value="2")
+        self.phase_h_var = tk.StringVar(value="0")
+        self.phase_v_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="Connecting...")
         self._build_ui()
 
@@ -464,9 +473,11 @@ class NanoTrakControlWindow:
     def _build_ui(self):
         frame = ttk.Frame(self.top, padding=10)
         frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
 
         readback = ttk.LabelFrame(frame, text="NanoTrak status", padding=8)
-        readback.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        readback.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         ttk.Label(readback, text="Horizontal:").grid(row=0, column=0, sticky="w")
         ttk.Label(readback, textvariable=self.h_var, width=12).grid(row=0, column=1)
         ttk.Label(readback, text="Vertical:").grid(row=0, column=2, sticky="w")
@@ -475,7 +486,7 @@ class NanoTrakControlWindow:
         ttk.Label(readback, textvariable=self.mode_var, width=12).grid(
             row=1, column=1, pady=(5, 0)
         )
-        ttk.Label(readback, text="Optical signal:").grid(
+        ttk.Label(readback, textvariable=self.signal_label_var).grid(
             row=1, column=2, sticky="w", pady=(5, 0)
         )
         ttk.Label(readback, textvariable=self.signal_var, width=18).grid(
@@ -485,7 +496,7 @@ class NanoTrakControlWindow:
         self.refresh_btn.grid(row=0, column=4, rowspan=2, padx=(10, 0))
 
         tracking = ttk.LabelFrame(frame, text="Live NanoTrak H/V grid", padding=8)
-        tracking.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        tracking.grid(row=1, column=0, rowspan=4, sticky="n", padx=(0, 8), pady=(0, 8))
         self.tracking_canvas = tk.Canvas(
             tracking,
             width=320,
@@ -505,7 +516,7 @@ class NanoTrakControlWindow:
         self._draw_tracking_grid()
 
         target = ttk.LabelFrame(frame, text="Piezo position (% of range)", padding=8)
-        target.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        target.grid(row=1, column=1, sticky="ew", pady=(0, 8))
         ttk.Label(target, text="Horizontal").grid(row=0, column=0, sticky="w")
         self.target_h_entry = ttk.Entry(target, textvariable=self.target_h_var, width=10)
         self.target_h_entry.grid(row=0, column=1, padx=(6, 12))
@@ -515,42 +526,87 @@ class NanoTrakControlWindow:
         self.set_btn = ttk.Button(target, text="Set", command=self._on_set_position)
         self.set_btn.grid(row=0, column=4)
 
-        jog = ttk.LabelFrame(frame, text="Jog", padding=8)
-        jog.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(jog, text="Step (%)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(jog, textvariable=self.step_var, width=10).grid(
-            row=0, column=1, padx=(6, 0), pady=(0, 6)
-        )
-        pad = ttk.Frame(jog)
-        pad.grid(row=1, column=0, columnspan=4)
-        self.jog_buttons = []
-        for text, dh, dv, row, column in (
-            ("▲ V+", 0, 1, 0, 1),
-            ("◀ H-", -1, 0, 1, 0),
-            ("H+ ▶", 1, 0, 1, 2),
-            ("▼ V-", 0, -1, 2, 1),
-        ):
-            button = ttk.Button(
-                pad, text=text, width=8, command=lambda x=dh, y=dv: self._on_jog(x, y)
-            )
-            button.grid(row=row, column=column, padx=4, pady=3)
-            self.jog_buttons.append(button)
-        self.center_btn = ttk.Button(jog, text="Center (50%, 50%)", command=self._on_center)
-        self.center_btn.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-
-        modes = ttk.LabelFrame(frame, text="Auto track mode", padding=8)
-        modes.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        modes = ttk.LabelFrame(frame, text="Piezo mode and tracking", padding=8)
+        modes.grid(row=2, column=1, sticky="ew", pady=(0, 8))
         self.mode_buttons = []
         for column, (label, mode) in enumerate(
-            (("Piezo / Manual", 1), ("Latch", 2), ("Track", 3))
+            (
+                ("Manual", "manual"),
+                ("Latch", ThorlabsModularNanoTrak.MODE_LATCH),
+                ("Track", ThorlabsModularNanoTrak.MODE_TRACKING),
+            )
         ):
             button = ttk.Button(modes, text=label, command=lambda m=mode: self._on_mode(m))
             button.grid(row=0, column=column, padx=3, sticky="ew")
             modes.columnconfigure(column, weight=1)
             self.mode_buttons.append(button)
+        ttk.Label(modes, text="NT track radius (0–5):").grid(
+            row=1, column=0, sticky="w", padx=3, pady=(8, 0)
+        )
+        self.track_radius_entry = ttk.Entry(
+            modes, textvariable=self.track_radius_var, width=10
+        )
+        self.track_radius_entry.grid(row=1, column=1, padx=3, pady=(8, 0))
+        self.radius_apply_btn = ttk.Button(
+            modes, text="Set radius", command=self._on_set_track_radius
+        )
+        self.radius_apply_btn.grid(row=1, column=2, padx=3, pady=(8, 0), sticky="ew")
+        ttk.Label(modes, text="Track frequency (17.5-87.5 Hz):").grid(
+            row=2, column=0, sticky="w", padx=3, pady=(6, 0)
+        )
+        self.track_frequency_entry = ttk.Entry(
+            modes, textvariable=self.track_frequency_var, width=10
+        )
+        self.track_frequency_entry.grid(
+            row=2, column=1, sticky="w", padx=3, pady=(6, 0)
+        )
+        self.frequency_apply_btn = ttk.Button(
+            modes, text="Set frequency", command=self._on_set_track_frequency
+        )
+        self.frequency_apply_btn.grid(
+            row=2, column=2, sticky="ew", padx=3, pady=(6, 0)
+        )
+
+        settings = ttk.LabelFrame(frame, text="Piezo / NanoTrak settings", padding=8)
+        settings.grid(row=3, column=1, sticky="ew", pady=(0, 8))
+        ttk.Label(settings, text="Signal input:").grid(row=0, column=0, sticky="w")
+        self.feedback_combo = ttk.Combobox(
+            settings,
+            textvariable=self.feedback_var,
+            values=self.FEEDBACK_LABELS,
+            state="readonly",
+            width=22,
+        )
+        self.feedback_combo.grid(row=0, column=1, columnspan=2, padx=(6, 12), sticky="w")
+        self.feedback_apply_btn = ttk.Button(
+            settings, text="Apply", command=self._on_apply_feedback
+        )
+        self.feedback_apply_btn.grid(row=0, column=3)
+
+        ttk.Label(settings, text="NT channel A:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.chan_a_entry = ttk.Entry(settings, textvariable=self.chan_a_var, width=6)
+        self.chan_a_entry.grid(row=1, column=1, padx=(6, 12), pady=(6, 0), sticky="w")
+        ttk.Label(settings, text="Channel B:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        self.chan_b_entry = ttk.Entry(settings, textvariable=self.chan_b_var, width=6)
+        self.chan_b_entry.grid(row=1, column=3, padx=(6, 0), pady=(6, 0), sticky="w")
+        self.channel_apply_btn = ttk.Button(
+            settings, text="Apply", command=self._on_apply_channels
+        )
+        self.channel_apply_btn.grid(row=1, column=4, pady=(6, 0))
+
+        ttk.Label(settings, text="Phase H:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.phase_h_entry = ttk.Entry(settings, textvariable=self.phase_h_var, width=6)
+        self.phase_h_entry.grid(row=2, column=1, padx=(6, 12), pady=(6, 0), sticky="w")
+        ttk.Label(settings, text="Phase V:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self.phase_v_entry = ttk.Entry(settings, textvariable=self.phase_v_var, width=6)
+        self.phase_v_entry.grid(row=2, column=3, padx=(6, 0), pady=(6, 0), sticky="w")
+        self.phase_apply_btn = ttk.Button(
+            settings, text="Apply", command=self._on_apply_phase
+        )
+        self.phase_apply_btn.grid(row=2, column=4, pady=(6, 0))
 
         motors = ttk.LabelFrame(frame, text="Stepper trim while observing tracking", padding=8)
-        motors.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        motors.grid(row=4, column=1, sticky="ew", pady=(0, 8))
         ttk.Label(motors, text="X (mm):").grid(row=0, column=0, sticky="w")
         ttk.Label(motors, textvariable=self.motor_x_var, width=11).grid(row=0, column=1)
         ttk.Label(motors, text="Y (mm):").grid(row=0, column=2, sticky="w")
@@ -579,15 +635,18 @@ class NanoTrakControlWindow:
         if not self.include_motor_controls:
             motors.grid_remove()
 
-        ttk.Label(frame, textvariable=self.status_var, wraplength=360).grid(
-            row=6, column=0, sticky="w"
+        ttk.Label(frame, textvariable=self.status_var, wraplength=760).grid(
+            row=5, column=0, columnspan=2, sticky="w"
         )
         self._busy_widgets = [
             self.refresh_btn,
             self.set_btn,
-            self.center_btn,
             self.clear_trace_btn,
-            *self.jog_buttons,
+            self.feedback_apply_btn,
+            self.channel_apply_btn,
+            self.phase_apply_btn,
+            self.radius_apply_btn,
+            self.frequency_apply_btn,
             *self.mode_buttons,
             *(self.motor_jog_buttons if self.include_motor_controls else []),
         ]
@@ -654,6 +713,7 @@ class NanoTrakControlWindow:
         )
         canvas = self.tracking_canvas
         canvas.delete("tracking")
+        canvas.delete("track_radius")
         if len(self._trace) > 1:
             points = []
             for h, v in self._trace:
@@ -662,7 +722,36 @@ class NanoTrakControlWindow:
                 *points, fill="#38bdf8", width=2, smooth=False, tags="tracking"
             )
         x, y = to_canvas(horizontal, vertical)
-        marker = "#4ade80" if signal_good else "#fb7185"
+        self._last_position = (horizontal, vertical)
+        if self._track_radius_nt is not None:
+            # The full H/V range is 10 NT units, so one NT unit is 10% of
+            # either plotted piezo range.  Keep separate X/Y pixel radii
+            # because the plotting rectangle is not square.
+            radius_percent = self._track_radius_nt * 10.0
+            radius_x = (right - left) * radius_percent / 100.0
+            radius_y = (bottom - top) * radius_percent / 100.0
+            canvas.create_oval(
+                x - radius_x,
+                y - radius_y,
+                x + radius_x,
+                y + radius_y,
+                outline="#fbbf24",
+                width=2,
+                dash=(5, 3),
+                tags="track_radius",
+            )
+            canvas.create_text(
+                right - 4,
+                top + 8,
+                anchor="ne",
+                text=f"Radius {self._track_radius_nt:.3g} NT",
+                fill="#fbbf24",
+                tags="track_radius",
+            )
+        if signal_good is None:
+            marker = "#fbbf24"
+        else:
+            marker = "#4ade80" if signal_good else "#fb7185"
         canvas.create_line(x - 8, y, x + 8, y, fill=marker, width=2, tags="tracking")
         canvas.create_line(x, y - 8, x, y + 8, fill=marker, width=2, tags="tracking")
         canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=marker, width=2, tags="tracking")
@@ -694,9 +783,13 @@ class NanoTrakControlWindow:
                 self._result_queue.put(("closed",))
                 return
             try:
+                push_status = True
                 if name == "connect":
                     self.controller = ThorlabsModularNanoTrak(self.nanotrak_serial, poll_ms=50)
                     self.controller.connect()
+                    # Default to Latch so the outputs hold still and tracking
+                    # does not start dithering as soon as the device connects.
+                    self.controller.set_mode(self.controller.MODE_LATCH)
                     if self.include_motor_controls:
                         self.motorx = ThorlabsModularStepperController(
                             serial=self.serial,
@@ -727,19 +820,52 @@ class NanoTrakControlWindow:
                     self._result_queue.put(("connected",))
                     if self.include_motor_controls:
                         self._push_motor_positions()
+                    self._push_settings(refresh=True)
                 elif name == "set_position":
                     self.controller.set_position_percent(command[1], command[2])
-                elif name == "jog":
-                    h, v = self.controller.get_position_percent()
-                    self.controller.set_position_percent(h + command[1], v + command[2])
+                    self._result_queue.put(("manual_active", True))
                 elif name == "set_mode":
-                    self.controller.set_mode(command[1])
+                    if command[1] == "manual":
+                        self.controller.set_mode(self.controller.MODE_LATCH)
+                        self._result_queue.put(("manual_active", True))
+                    else:
+                        self.controller.set_mode(command[1])
+                        self._result_queue.put(("manual_active", False))
                 elif name == "motor_jog":
                     motor = self.motorx if command[1] == "x" else self.motory
                     motor.move_relative(command[2], wait=True, real_unit=True)
                     self._push_motor_positions()
+                elif name == "get_settings":
+                    self._push_settings(refresh=True)
+                elif name == "set_track_radius":
+                    radius = self.controller.set_track_radius_nt(command[1])
+                    self._result_queue.put(("setting_applied", "radius", radius))
+                    push_status = False
+                elif name == "set_track_frequency":
+                    frequency = self.controller.set_track_frequency_hz(command[1])
+                    self._result_queue.put(
+                        ("setting_applied", "frequency", frequency)
+                    )
+                    push_status = False
+                elif name == "set_feedback_source":
+                    source = self.controller.set_feedback_source(command[1])
+                    self._result_queue.put(("setting_applied", "feedback", source))
+                    push_status = False
+                elif name == "set_nt_channels":
+                    channels = self.controller.set_nt_channels(command[1], command[2])
+                    self._result_queue.put(
+                        ("setting_applied", "channels", *channels)
+                    )
+                    push_status = False
+                elif name == "set_phase_compensation":
+                    phase = self.controller.set_phase_compensation(
+                        command[1], command[2]
+                    )
+                    self._result_queue.put(("setting_applied", "phase", *phase))
+                    push_status = False
                 self._connected = True
-                self._push_status()
+                if push_status:
+                    self._push_status()
                 self._result_queue.put(("ready",))
             except Exception as exc:
                 self._result_queue.put(("error", str(exc)))
@@ -748,12 +874,36 @@ class NanoTrakControlWindow:
         h, v = self.controller.get_position_percent()
         mode = self.controller.get_mode()
         signal_good, reading = self.controller.get_signal()
-        self._result_queue.put(("status", h, v, mode, signal_good, reading))
+        feedback_source = self.controller.get_feedback_source()
+        self._result_queue.put(
+            ("status", h, v, mode, signal_good, reading, feedback_source)
+        )
 
     def _push_motor_positions(self):
         x = self.motorx.get_position(real_unit=True)
         y = self.motory.get_position(real_unit=True)
         self._result_queue.put(("motor_position", x, y))
+
+    def _push_settings(self, refresh=False):
+        if refresh:
+            self.controller.refresh_settings_cache()
+        feedback_source = self.controller.get_feedback_source()
+        chan_a, chan_b = self.controller.get_nt_channels()
+        phase_h, phase_v = self.controller.get_phase_compensation()
+        track_radius = self.controller.get_track_radius_nt()
+        track_frequency = self.controller.get_track_frequency_hz()
+        self._result_queue.put(
+            (
+                "settings",
+                feedback_source,
+                chan_a,
+                chan_b,
+                phase_h,
+                phase_v,
+                track_radius,
+                track_frequency,
+            )
+        )
 
     def _send(self, command):
         if self._closing:
@@ -763,7 +913,7 @@ class NanoTrakControlWindow:
         self._command_queue.put(command)
 
     def _on_refresh(self):
-        self._send(("refresh",))
+        self._send(("get_settings",))
 
     def _on_set_position(self):
         try:
@@ -779,24 +929,63 @@ class NanoTrakControlWindow:
             return
         self._send(("set_position", h, v))
 
-    def _on_jog(self, h_direction, v_direction):
-        try:
-            step = float(self.step_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid input", "Jog step must be a number.")
-            return
-        if step <= 0:
-            messagebox.showerror("Invalid input", "Jog step must be positive.")
-            return
-        self._send(("jog", h_direction * step, v_direction * step))
-
-    def _on_center(self):
-        self.target_h_var.set("50.0")
-        self.target_v_var.set("50.0")
-        self._send(("set_position", 50.0, 50.0))
-
     def _on_mode(self, mode):
         self._send(("set_mode", mode))
+
+    def _on_set_track_radius(self):
+        try:
+            radius = float(self.track_radius_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "NT track radius must be a number.")
+            return
+        max_radius = ThorlabsModularNanoTrak.TRACK_RADIUS_MAX_NT
+        if not 0 <= radius <= max_radius:
+            messagebox.showerror(
+                "Invalid input",
+                f"NT track radius must be between 0 and {max_radius:g} NT units.",
+            )
+            return
+        self._send(("set_track_radius", radius))
+
+    def _on_set_track_frequency(self):
+        try:
+            frequency = float(self.track_frequency_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Track frequency must be a number.")
+            return
+        minimum = ThorlabsModularNanoTrak.TRACK_FREQUENCY_MIN_HZ
+        maximum = ThorlabsModularNanoTrak.TRACK_FREQUENCY_MAX_HZ
+        if not minimum <= frequency <= maximum:
+            messagebox.showerror(
+                "Invalid input",
+                f"Track frequency must be between {minimum:g} and {maximum:g} Hz.",
+            )
+            return
+        self._send(("set_track_frequency", frequency))
+
+    def _on_apply_feedback(self):
+        source = self.FEEDBACK_BY_LABEL.get(self.feedback_var.get())
+        if source is None:
+            return
+        self._send(("set_feedback_source", source))
+
+    def _on_apply_channels(self):
+        try:
+            chan_a = int(self.chan_a_var.get())
+            chan_b = int(self.chan_b_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "NT channels A/B must be integers.")
+            return
+        self._send(("set_nt_channels", chan_a, chan_b))
+
+    def _on_apply_phase(self):
+        try:
+            phase_h = int(self.phase_h_var.get())
+            phase_v = int(self.phase_v_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Phase H/V must be integers.")
+            return
+        self._send(("set_phase_compensation", phase_h, phase_v))
 
     def _on_motor_jog(self, axis, direction):
         try:
@@ -819,27 +1008,98 @@ class NanoTrakControlWindow:
                 if kind == "connected":
                     self.status_var.set("Connected to rack NanoTrak.")
                 elif kind == "status":
-                    _, h, v, mode, signal_good, reading = message
+                    _, h, v, mode, signal_good, reading, feedback_source = message
                     self.h_var.set(f"{h:.4f}%")
                     self.v_var.set(f"{v:.4f}%")
                     if self.top.focus_get() not in (self.target_h_entry, self.target_v_entry):
                         self.target_h_var.set(f"{h:.6g}")
                         self.target_v_var.set(f"{v:.6g}")
-                    self.mode_var.set(
-                        ThorlabsModularNanoTrak.MODE_NAMES.get(mode, f"Unknown ({mode})")
-                    )
+                    if self._manual_active and mode == ThorlabsModularNanoTrak.MODE_LATCH:
+                        self.mode_var.set("Manual (latched)")
+                    else:
+                        self.mode_var.set(
+                            ThorlabsModularNanoTrak.MODE_NAMES.get(
+                                mode, f"Unknown ({mode})"
+                            )
+                        )
+                    self._feedback_source = feedback_source
                     state = "good" if signal_good else "bad"
-                    self.signal_var.set(f"{reading:.6g} ({state})")
-                    self._update_tracking_grid(h, v, signal_good)
+                    if feedback_source == ThorlabsModularNanoTrak.FEEDBACK_TIA:
+                        self.signal_label_var.set("Optical power (PIN/TIA):")
+                        self.signal_var.set(f"{reading:.6g} ({state})")
+                        display_signal_good = signal_good
+                    else:
+                        self.signal_label_var.set("BNC voltage:")
+                        self.signal_var.set(f"{reading:.6g} V")
+                        display_signal_good = None
+                    self._update_tracking_grid(h, v, display_signal_good)
+                elif kind == "manual_active":
+                    self._manual_active = message[1]
+                elif kind == "setting_applied":
+                    setting = message[1]
+                    if setting == "radius":
+                        self._track_radius_nt = message[2]
+                        self.track_radius_var.set(f"{message[2]:.6g}")
+                    elif setting == "frequency":
+                        self.track_frequency_var.set(f"{message[2]:.6g}")
+                    elif setting == "feedback":
+                        source = message[2]
+                        self._feedback_source = source
+                        self.feedback_var.set(
+                            ThorlabsModularNanoTrak.FEEDBACK_NAMES[source]
+                        )
+                        if source == ThorlabsModularNanoTrak.FEEDBACK_TIA:
+                            self.signal_label_var.set("Optical power (PIN/TIA):")
+                        else:
+                            self.signal_label_var.set("BNC voltage:")
+                    elif setting == "channels":
+                        self.chan_a_var.set(str(message[2]))
+                        self.chan_b_var.set(str(message[3]))
+                    elif setting == "phase":
+                        self.phase_h_var.set(str(message[2]))
+                        self.phase_v_var.set(str(message[3]))
                 elif kind == "motor_position":
                     self.motor_x_var.set(f"{message[1]:.6f}")
                     self.motor_y_var.set(f"{message[2]:.6f}")
+                elif kind == "settings":
+                    (
+                        _,
+                        feedback_source,
+                        chan_a,
+                        chan_b,
+                        phase_h,
+                        phase_v,
+                        track_radius,
+                        track_frequency,
+                    ) = message
+                    focused = self.top.focus_get()
+                    if focused not in (self.feedback_combo,):
+                        self.feedback_var.set(
+                            ThorlabsModularNanoTrak.FEEDBACK_NAMES.get(
+                                feedback_source, f"Unknown ({feedback_source})"
+                            )
+                        )
+                    if focused not in (self.chan_a_entry, self.chan_b_entry):
+                        self.chan_a_var.set(str(chan_a))
+                        self.chan_b_var.set(str(chan_b))
+                    if focused not in (self.phase_h_entry, self.phase_v_entry):
+                        self.phase_h_var.set(str(phase_h))
+                        self.phase_v_var.set(str(phase_v))
+                    self._track_radius_nt = track_radius
+                    self._feedback_source = feedback_source
+                    if focused is not self.track_radius_entry:
+                        self.track_radius_var.set(f"{track_radius:.6g}")
+                    if focused is not self.track_frequency_entry:
+                        self.track_frequency_var.set(f"{track_frequency:.6g}")
                 elif kind == "ready":
                     self.status_var.set("Ready.")
                     self._set_controls_enabled(True)
                 elif kind == "error":
                     self.status_var.set(f"Error: {message[1]}")
-                    messagebox.showerror("NanoTrak error", message[1])
+                    toplevel = self.top.winfo_toplevel()
+                    toplevel.lift()
+                    toplevel.focus_force()
+                    messagebox.showerror("NanoTrak error", message[1], parent=self.top)
                     self._set_controls_enabled(True)
                 elif kind == "closed":
                     self._finish_close()
@@ -883,6 +1143,19 @@ class ScanGUI:
         self.manual_window = None
         self.nanotrak_window = None
 
+        # Shared X/Y stepper connection, connected lazily on first use (see
+        # _get_shared_motors) and kept open for the app's lifetime instead
+        # of reconnecting for every Manual Control session, scan, or home --
+        # each of those used to own a private connection and tear it down
+        # afterward, which meant paying the ~1.5s connect handshake
+        # constantly. Safe to share across them because the existing
+        # worker/tab-switch guards already ensure at most one of Manual
+        # Control, a scan, homing, or "center at current position" is ever
+        # actively issuing motor commands at a time.
+        self.motorx = None
+        self.motory = None
+        self._motor_connect_lock = threading.Lock()
+
         # Grid/line rebuild cache (see scan_engine.build_scan_grid_incremental)
         # and the background thread that runs it during a live scan.
         self._grid_cache = {}
@@ -912,8 +1185,50 @@ class ScanGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(REDRAW_INTERVAL_MS, self._poll_queue)
+        self._grow_window_to_fit()
 
     # ---------------------------------------------------------------- UI
+
+    def _grow_window_to_fit(self):
+        """
+        Grow the root window if the currently-selected tab needs more room
+        than the window currently has. Tabs other than Scan are built
+        lazily (see _activate_manual_control/_activate_nanotrak_control),
+        so the window's initial size -- based only on the Scan tab -- can
+        be too short for a tab with more stacked sections, clipping its
+        bottom controls. Never shrinks a window the user has already
+        enlarged.
+        """
+        self.root.update_idletasks()
+        required_width = self.notebook.winfo_reqwidth()
+        required_height = self.notebook.winfo_reqheight()
+        current_width = max(self.root.winfo_width(), 1)
+        current_height = max(self.root.winfo_height(), 1)
+        new_width = max(current_width, required_width)
+        new_height = max(current_height, required_height)
+        if new_width != current_width or new_height != current_height:
+            self.root.geometry(f"{new_width}x{new_height}")
+
+    def _get_shared_motors(self):
+        """
+        Return the shared (motorx, motory), connecting them on first call.
+
+        Must be called from a background thread, not the Tk main loop --
+        the first call blocks for the connect handshake (~1.5s). Safe to
+        call repeatedly/from different worker threads over the app's
+        lifetime since only one such thread is ever active at a time (see
+        the comment in __init__); the lock here only protects the
+        connect-once check itself.
+        """
+        with self._motor_connect_lock:
+            if self.motorx is None:
+                motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
+                motory = ThorlabsModularStepperController(serial=SERIAL, channel=2, poll_ms=1)
+                motorx.connect()
+                motory.connect()
+                self.motorx = motorx
+                self.motory = motory
+        return self.motorx, self.motory
 
     def _build_controls(self, master):
         panel = ttk.Frame(master, padding=10)
@@ -1089,10 +1404,12 @@ class ScanGUI:
 
         def worker_fn():
             try:
+                motorx, motory = self._get_shared_motors()
                 if scan_mode.startswith("jog_"):
                     jog_axis = scan_mode[-1]
                     scan_rows = run_jog_scan(
-                        serial=SERIAL,
+                        motorx=motorx,
+                        motory=motory,
                         arduino_port=ARDUINO_PORT,
                         arduino_baud=ARDUINO_BAUD,
                         x0=params["x0"],
@@ -1114,7 +1431,8 @@ class ScanGUI:
                     )
                 else:
                     scan_rows = run_scan(
-                        serial=SERIAL,
+                        motorx=motorx,
+                        motory=motory,
                         arduino_port=ARDUINO_PORT,
                         arduino_baud=ARDUINO_BAUD,
                         x0=params["x0"],
@@ -1171,23 +1489,12 @@ class ScanGUI:
         self.status_var.set("Reading motor positions...")
 
         def worker_fn():
-            motorx = None
-            motory = None
             try:
-                motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
-                motory = ThorlabsModularStepperController(serial=SERIAL, channel=2, poll_ms=1)
-                motorx.connect()
-                motory.connect()
+                motorx, motory = self._get_shared_motors()
                 x = motorx.get_position(real_unit=True)
                 y = motory.get_position(real_unit=True)
-                motorx.disconnect()
-                motory.disconnect()
                 self.result_queue.put(("position_done", x, y))
             except Exception as exc:
-                if motorx is not None:
-                    motorx.safe_shutdown()
-                if motory is not None:
-                    motory.safe_shutdown()
                 self.result_queue.put(("position_error", str(exc)))
 
         self.worker = threading.Thread(target=worker_fn, daemon=True)
@@ -1204,24 +1511,13 @@ class ScanGUI:
         self.status_var.set("Homing motors...")
 
         def worker_fn():
-            motorx = None
-            motory = None
             try:
-                motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
-                motory = ThorlabsModularStepperController(serial=SERIAL, channel=2, poll_ms=1)
-                motorx.connect()
-                motory.connect()
+                motorx, motory = self._get_shared_motors()
                 check_connection_and_home(
                     motorx=motorx, motory=motory, home_timeout_s=HOME_TIMEOUT_S
                 )
-                motorx.disconnect()
-                motory.disconnect()
                 self.result_queue.put(("home_done",))
             except Exception as exc:
-                if motorx is not None:
-                    motorx.safe_shutdown()
-                if motory is not None:
-                    motory.safe_shutdown()
                 self.result_queue.put(("home_error", str(exc)))
 
         self.worker = threading.Thread(target=worker_fn, daemon=True)
@@ -1248,10 +1544,11 @@ class ScanGUI:
         }
         self.manual_window = ManualControlWindow(
             self.manual_tab,
-            serial=SERIAL,
+            get_motors=self._get_shared_motors,
             defaults=defaults,
             embedded=True,
         )
+        self._grow_window_to_fit()
 
     def _deactivate_manual_control(self):
         if self.manual_window is None:
@@ -1273,6 +1570,7 @@ class ScanGUI:
             embedded=True,
             include_motor_controls=False,
         )
+        self._grow_window_to_fit()
 
     def _on_load(self):
         path = filedialog.askopenfilename(
@@ -1541,6 +1839,13 @@ class ScanGUI:
             self.manual_window.close(wait=True)
         if self.nanotrak_window is not None:
             self.nanotrak_window.close(wait=True)
+        # The shared motor connection (see _get_shared_motors) is only
+        # ever torn down here, on final app close -- every other consumer
+        # (Manual Control, scans, homing) just stops referencing it.
+        if self.motorx is not None:
+            self.motorx.safe_shutdown()
+        if self.motory is not None:
+            self.motory.safe_shutdown()
         self._render_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 

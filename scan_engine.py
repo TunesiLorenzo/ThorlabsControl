@@ -401,7 +401,9 @@ def print_scan_timing_stats(scan_rows):
 
 def run_scan(
     *,
-    serial,
+    serial=None,
+    motorx=None,
+    motory=None,
     arduino_port,
     arduino_baud,
     x0,
@@ -444,30 +446,44 @@ def run_scan(
     stop_event, if given, is checked before each new row starts; if set, the
     scan ends early with whatever rows were already completed (motors are
     left stationary at the end of the last finished row, not mid-move).
+
+    Pass already-connected motorx/motory (e.g. a persistent connection a
+    GUI keeps open across scans) to reuse them instead of connecting and
+    disconnecting fresh each call -- ownership stays with the caller, who
+    is responsible for eventually disconnecting them. Otherwise, give
+    serial and this function owns a connection for the scan's duration.
     """
+    if motorx is None and motory is None:
+        if serial is None:
+            raise ValueError("run_scan requires either serial or motorx/motory")
+        owns_motors = True
+    else:
+        if motorx is None or motory is None:
+            raise ValueError("motorx and motory must both be given, or neither")
+        owns_motors = False
+
     x_start = x0 - x_span / 2
     y_start = y0 - y_span / 2
     y_points = build_axis_points(y_start, y_span, line_spacing)
     scan_rows = []
 
-    motorx = None
-    motory = None
     ser = None
     scan_failed = True
 
     try:
-        motorx = ThorlabsModularStepperController(
-            serial=serial,
-            channel=1,
-            poll_ms=1,
-        )
-        motory = ThorlabsModularStepperController(
-            serial=serial,
-            channel=2,
-            poll_ms=1,
-        )
-        motorx.connect()
-        motory.connect()
+        if owns_motors:
+            motorx = ThorlabsModularStepperController(
+                serial=serial,
+                channel=1,
+                poll_ms=1,
+            )
+            motory = ThorlabsModularStepperController(
+                serial=serial,
+                channel=2,
+                poll_ms=1,
+            )
+            motorx.connect()
+            motory.connect()
         if skip_homing_check:
             print("Skipping motor connection/homing check.")
         else:
@@ -666,16 +682,26 @@ def run_scan(
         if ser is not None:
             close_arduino(ser)
 
-        if scan_failed:
-            if motorx is not None:
-                motorx.safe_shutdown()
-            if motory is not None:
-                motory.safe_shutdown()
-        else:
-            if motorx is not None:
-                motorx.disconnect()
-            if motory is not None:
-                motory.disconnect()
+        if owns_motors:
+            if scan_failed:
+                if motorx is not None:
+                    motorx.safe_shutdown()
+                if motory is not None:
+                    motory.safe_shutdown()
+            else:
+                if motorx is not None:
+                    motorx.disconnect()
+                if motory is not None:
+                    motory.disconnect()
+        elif scan_failed:
+            # Shared motors stay connected either way (the caller owns
+            # their lifecycle) -- but still stop them for safety if the
+            # scan failed mid-motion.
+            for motor in (motorx, motory):
+                try:
+                    motor.stop_profiled()
+                except Exception:
+                    pass
 
     if save_file and scan_rows:
         np.savez(save_file, scan_rows=np.array(scan_rows, dtype=object))
@@ -686,7 +712,9 @@ def run_scan(
 
 def run_jog_scan(
     *,
-    serial,
+    serial=None,
+    motorx=None,
+    motory=None,
     arduino_port,
     arduino_baud,
     x0,
@@ -713,6 +741,9 @@ def run_jog_scan(
     averaged into one value at that explicit measured X position. Intended
     for fine-tuning around a line already located with a coarser raster
     scan, not for surveying a 2D area.
+
+    Pass already-connected motorx/motory to reuse a persistent connection
+    instead of connecting/disconnecting fresh each call (see run_scan).
     """
     axis = str(axis).lower()
     if axis not in ("x", "y"):
@@ -722,20 +753,28 @@ def run_jog_scan(
     if sample_duration_s <= 0:
         raise ValueError("sample_duration_s must be positive")
 
+    if motorx is None and motory is None:
+        if serial is None:
+            raise ValueError("run_jog_scan requires either serial or motorx/motory")
+        owns_motors = True
+    else:
+        if motorx is None or motory is None:
+            raise ValueError("motorx and motory must both be given, or neither")
+        owns_motors = False
+
     center = x0 if axis == "x" else y0
     points = build_axis_points(center - x_span / 2, x_span, jog_spacing)
     scan_rows = []
 
-    motorx = None
-    motory = None
     ser = None
     scan_failed = True
 
     try:
-        motorx = ThorlabsModularStepperController(serial=serial, channel=1, poll_ms=1)
-        motory = ThorlabsModularStepperController(serial=serial, channel=2, poll_ms=1)
-        motorx.connect()
-        motory.connect()
+        if owns_motors:
+            motorx = ThorlabsModularStepperController(serial=serial, channel=1, poll_ms=1)
+            motory = ThorlabsModularStepperController(serial=serial, channel=2, poll_ms=1)
+            motorx.connect()
+            motory.connect()
 
         if skip_homing_check:
             print("Skipping motor connection/homing check.")
@@ -851,16 +890,23 @@ def run_jog_scan(
         if ser is not None:
             close_arduino(ser)
 
-        if scan_failed:
-            if motorx is not None:
-                motorx.safe_shutdown()
-            if motory is not None:
-                motory.safe_shutdown()
-        else:
-            if motorx is not None:
-                motorx.disconnect()
-            if motory is not None:
-                motory.disconnect()
+        if owns_motors:
+            if scan_failed:
+                if motorx is not None:
+                    motorx.safe_shutdown()
+                if motory is not None:
+                    motory.safe_shutdown()
+            else:
+                if motorx is not None:
+                    motorx.disconnect()
+                if motory is not None:
+                    motory.disconnect()
+        elif scan_failed:
+            for motor in (motorx, motory):
+                try:
+                    motor.stop_profiled()
+                except Exception:
+                    pass
 
     if save_file and scan_rows:
         np.savez(save_file, scan_rows=np.array(scan_rows, dtype=object))
