@@ -406,6 +406,7 @@ class NanoTrakControlWindow:
     FEEDBACK_BY_LABEL = {
         label: key for key, label in ThorlabsModularNanoTrak.FEEDBACK_NAMES.items()
     }
+    DEFAULT_TRACK_FREQUENCY_HZ = 18.0
 
     def __init__(
         self,
@@ -449,7 +450,7 @@ class NanoTrakControlWindow:
         self.target_h_var = tk.StringVar(value="50.0")
         self.target_v_var = tk.StringVar(value="50.0")
         self.track_radius_var = tk.StringVar(value="0.5")
-        self.track_frequency_var = tk.StringVar(value="17.5")
+        self.track_frequency_var = tk.StringVar(value="18.0")
         self.mode_var = tk.StringVar(value="--")
         self.signal_label_var = tk.StringVar(value="Optical power (PIN/TIA):")
         self.signal_var = tk.StringVar(value="--")
@@ -458,12 +459,28 @@ class NanoTrakControlWindow:
         self.motor_y_var = tk.StringVar(value="--")
         self.motor_step_var = tk.StringVar(value="0.01")
         self.feedback_var = tk.StringVar(value=self.FEEDBACK_LABELS[0])
-        self.chan_a_var = tk.StringVar(value="1")
-        self.chan_b_var = tk.StringVar(value="2")
         self.phase_h_var = tk.StringVar(value="0")
         self.phase_v_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="Connecting...")
         self._build_ui()
+
+        # Maps a queued command name to (handler, refreshes_status). Declaring
+        # "does this command need a follow-up _push_status()" right next to
+        # its handler -- instead of as a shared mutable flag threaded through
+        # a long if/elif chain -- means a new command that forgets to set it
+        # simply isn't in the table, rather than silently inheriting whatever
+        # flag value the previous command happened to leave behind.
+        self._command_handlers = {
+            "connect": (self._cmd_connect, True),
+            "set_position": (self._cmd_set_position, True),
+            "set_mode": (self._cmd_set_mode, True),
+            "motor_jog": (self._cmd_motor_jog, True),
+            "get_settings": (self._cmd_get_settings, True),
+            "set_track_radius": (self._cmd_set_track_radius, False),
+            "set_track_frequency": (self._cmd_set_track_frequency, False),
+            "set_feedback_source": (self._cmd_set_feedback_source, False),
+            "set_phase_compensation": (self._cmd_set_phase_compensation, False),
+        }
 
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -583,27 +600,16 @@ class NanoTrakControlWindow:
         )
         self.feedback_apply_btn.grid(row=0, column=3)
 
-        ttk.Label(settings, text="NT channel A:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.chan_a_entry = ttk.Entry(settings, textvariable=self.chan_a_var, width=6)
-        self.chan_a_entry.grid(row=1, column=1, padx=(6, 12), pady=(6, 0), sticky="w")
-        ttk.Label(settings, text="Channel B:").grid(row=1, column=2, sticky="w", pady=(6, 0))
-        self.chan_b_entry = ttk.Entry(settings, textvariable=self.chan_b_var, width=6)
-        self.chan_b_entry.grid(row=1, column=3, padx=(6, 0), pady=(6, 0), sticky="w")
-        self.channel_apply_btn = ttk.Button(
-            settings, text="Apply", command=self._on_apply_channels
-        )
-        self.channel_apply_btn.grid(row=1, column=4, pady=(6, 0))
-
-        ttk.Label(settings, text="Phase H:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(settings, text="Phase H:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.phase_h_entry = ttk.Entry(settings, textvariable=self.phase_h_var, width=6)
-        self.phase_h_entry.grid(row=2, column=1, padx=(6, 12), pady=(6, 0), sticky="w")
-        ttk.Label(settings, text="Phase V:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self.phase_h_entry.grid(row=1, column=1, padx=(6, 12), pady=(6, 0), sticky="w")
+        ttk.Label(settings, text="Phase V:").grid(row=1, column=2, sticky="w", pady=(6, 0))
         self.phase_v_entry = ttk.Entry(settings, textvariable=self.phase_v_var, width=6)
-        self.phase_v_entry.grid(row=2, column=3, padx=(6, 0), pady=(6, 0), sticky="w")
+        self.phase_v_entry.grid(row=1, column=3, padx=(6, 0), pady=(6, 0), sticky="w")
         self.phase_apply_btn = ttk.Button(
             settings, text="Apply", command=self._on_apply_phase
         )
-        self.phase_apply_btn.grid(row=2, column=4, pady=(6, 0))
+        self.phase_apply_btn.grid(row=1, column=4, pady=(6, 0))
 
         motors = ttk.LabelFrame(frame, text="Stepper trim while observing tracking", padding=8)
         motors.grid(row=4, column=1, sticky="ew", pady=(0, 8))
@@ -643,7 +649,6 @@ class NanoTrakControlWindow:
             self.set_btn,
             self.clear_trace_btn,
             self.feedback_apply_btn,
-            self.channel_apply_btn,
             self.phase_apply_btn,
             self.radius_apply_btn,
             self.frequency_apply_btn,
@@ -763,6 +768,17 @@ class NanoTrakControlWindow:
         self._trace.clear()
         self.tracking_canvas.delete("tracking")
 
+    def _safe_focus_get(self):
+        # While a ttk.Combobox dropdown is open, Tk reports focus as an
+        # internal "popdown" listbox that isn't a real registered child, so
+        # focus_get()'s name lookup raises KeyError (and sometimes
+        # TclError). Treat that the same as "focus is on something we
+        # don't need to protect".
+        try:
+            return self.top.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+
     def _worker_loop(self):
         while True:
             try:
@@ -783,92 +799,92 @@ class NanoTrakControlWindow:
                 self._result_queue.put(("closed",))
                 return
             try:
-                push_status = True
-                if name == "connect":
-                    self.controller = ThorlabsModularNanoTrak(self.nanotrak_serial, poll_ms=50)
-                    self.controller.connect()
-                    # Default to Latch so the outputs hold still and tracking
-                    # does not start dithering as soon as the device connects.
-                    self.controller.set_mode(self.controller.MODE_LATCH)
-                    if self.include_motor_controls:
-                        self.motorx = ThorlabsModularStepperController(
-                            serial=self.serial,
-                            channel=1,
-                            kinesis_dir=self.controller.kinesis_dir,
-                            poll_ms=50,
-                        )
-                        self.motory = ThorlabsModularStepperController(
-                            serial=self.serial,
-                            channel=2,
-                            kinesis_dir=self.controller.kinesis_dir,
-                            poll_ms=50,
-                        )
-                        self.motorx.connect()
-                        self.motory.connect()
-                        try:
-                            acceleration = float(self.defaults.get("acceleration", "4.0"))
-                            max_velocity = float(self.defaults.get("max_velocity", "4.0"))
-                            self.motorx.set_velocity_params(
-                                acceleration, max_velocity, real_unit=True
-                            )
-                            self.motory.set_velocity_params(
-                                acceleration, max_velocity, real_unit=True
-                            )
-                        except ValueError:
-                            pass
-                    self._connected = True
-                    self._result_queue.put(("connected",))
-                    if self.include_motor_controls:
-                        self._push_motor_positions()
-                    self._push_settings(refresh=True)
-                elif name == "set_position":
-                    self.controller.set_position_percent(command[1], command[2])
-                    self._result_queue.put(("manual_active", True))
-                elif name == "set_mode":
-                    if command[1] == "manual":
-                        self.controller.set_mode(self.controller.MODE_LATCH)
-                        self._result_queue.put(("manual_active", True))
-                    else:
-                        self.controller.set_mode(command[1])
-                        self._result_queue.put(("manual_active", False))
-                elif name == "motor_jog":
-                    motor = self.motorx if command[1] == "x" else self.motory
-                    motor.move_relative(command[2], wait=True, real_unit=True)
-                    self._push_motor_positions()
-                elif name == "get_settings":
-                    self._push_settings(refresh=True)
-                elif name == "set_track_radius":
-                    radius = self.controller.set_track_radius_nt(command[1])
-                    self._result_queue.put(("setting_applied", "radius", radius))
-                    push_status = False
-                elif name == "set_track_frequency":
-                    frequency = self.controller.set_track_frequency_hz(command[1])
-                    self._result_queue.put(
-                        ("setting_applied", "frequency", frequency)
-                    )
-                    push_status = False
-                elif name == "set_feedback_source":
-                    source = self.controller.set_feedback_source(command[1])
-                    self._result_queue.put(("setting_applied", "feedback", source))
-                    push_status = False
-                elif name == "set_nt_channels":
-                    channels = self.controller.set_nt_channels(command[1], command[2])
-                    self._result_queue.put(
-                        ("setting_applied", "channels", *channels)
-                    )
-                    push_status = False
-                elif name == "set_phase_compensation":
-                    phase = self.controller.set_phase_compensation(
-                        command[1], command[2]
-                    )
-                    self._result_queue.put(("setting_applied", "phase", *phase))
-                    push_status = False
+                handler, refreshes_status = self._command_handlers[name]
+                handler(command)
                 self._connected = True
-                if push_status:
+                if refreshes_status:
                     self._push_status()
                 self._result_queue.put(("ready",))
             except Exception as exc:
                 self._result_queue.put(("error", str(exc)))
+
+    # ---------------------------------------------- worker command handlers
+    # Each of these runs on the worker thread and pushes whatever result
+    # message(s) the GUI needs; see _command_handlers in __init__ for
+    # which ones additionally get a follow-up _push_status().
+
+    def _cmd_connect(self, command):
+        self.controller = ThorlabsModularNanoTrak(self.nanotrak_serial, poll_ms=50)
+        self.controller.connect()
+        # connect() already defaults to Latch mode; frequency has no such
+        # device-side default, so pin it here to this app's preferred value.
+        self.controller.set_track_frequency_hz(self.DEFAULT_TRACK_FREQUENCY_HZ)
+        if self.include_motor_controls:
+            self._connect_motors()
+        self._connected = True
+        self._result_queue.put(("connected",))
+        if self.include_motor_controls:
+            self._push_motor_positions()
+        self._push_settings()
+
+    def _connect_motors(self):
+        self.motorx = ThorlabsModularStepperController(
+            serial=self.serial,
+            channel=1,
+            kinesis_dir=self.controller.kinesis_dir,
+            poll_ms=50,
+        )
+        self.motory = ThorlabsModularStepperController(
+            serial=self.serial,
+            channel=2,
+            kinesis_dir=self.controller.kinesis_dir,
+            poll_ms=50,
+        )
+        self.motorx.connect()
+        self.motory.connect()
+        try:
+            acceleration = float(self.defaults.get("acceleration", "4.0"))
+            max_velocity = float(self.defaults.get("max_velocity", "4.0"))
+            self.motorx.set_velocity_params(acceleration, max_velocity, real_unit=True)
+            self.motory.set_velocity_params(acceleration, max_velocity, real_unit=True)
+        except ValueError:
+            pass
+
+    def _cmd_set_position(self, command):
+        self.controller.set_position_percent(command[1], command[2])
+        self._result_queue.put(("manual_active", True))
+
+    def _cmd_set_mode(self, command):
+        if command[1] == "manual":
+            self.controller.set_mode(self.controller.MODE_LATCH)
+            self._result_queue.put(("manual_active", True))
+        else:
+            self.controller.set_mode(command[1])
+            self._result_queue.put(("manual_active", False))
+
+    def _cmd_motor_jog(self, command):
+        motor = self.motorx if command[1] == "x" else self.motory
+        motor.move_relative(command[2], wait=True, real_unit=True)
+        self._push_motor_positions()
+
+    def _cmd_get_settings(self, command):
+        self._push_settings()
+
+    def _cmd_set_track_radius(self, command):
+        radius = self.controller.set_track_radius_nt(command[1])
+        self._result_queue.put(("setting_applied", "radius", radius))
+
+    def _cmd_set_track_frequency(self, command):
+        frequency = self.controller.set_track_frequency_hz(command[1])
+        self._result_queue.put(("setting_applied", "frequency", frequency))
+
+    def _cmd_set_feedback_source(self, command):
+        source = self.controller.set_feedback_source(command[1])
+        self._result_queue.put(("setting_applied", "feedback", source))
+
+    def _cmd_set_phase_compensation(self, command):
+        phase = self.controller.set_phase_compensation(command[1], command[2])
+        self._result_queue.put(("setting_applied", "phase", *phase))
 
     def _push_status(self):
         h, v = self.controller.get_position_percent()
@@ -884,11 +900,8 @@ class NanoTrakControlWindow:
         y = self.motory.get_position(real_unit=True)
         self._result_queue.put(("motor_position", x, y))
 
-    def _push_settings(self, refresh=False):
-        if refresh:
-            self.controller.refresh_settings_cache()
+    def _push_settings(self):
         feedback_source = self.controller.get_feedback_source()
-        chan_a, chan_b = self.controller.get_nt_channels()
         phase_h, phase_v = self.controller.get_phase_compensation()
         track_radius = self.controller.get_track_radius_nt()
         track_frequency = self.controller.get_track_frequency_hz()
@@ -896,8 +909,6 @@ class NanoTrakControlWindow:
             (
                 "settings",
                 feedback_source,
-                chan_a,
-                chan_b,
                 phase_h,
                 phase_v,
                 track_radius,
@@ -969,15 +980,6 @@ class NanoTrakControlWindow:
             return
         self._send(("set_feedback_source", source))
 
-    def _on_apply_channels(self):
-        try:
-            chan_a = int(self.chan_a_var.get())
-            chan_b = int(self.chan_b_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid input", "NT channels A/B must be integers.")
-            return
-        self._send(("set_nt_channels", chan_a, chan_b))
-
     def _on_apply_phase(self):
         try:
             phase_h = int(self.phase_h_var.get())
@@ -998,6 +1000,74 @@ class NanoTrakControlWindow:
             return
         self._send(("motor_jog", axis, direction * step))
 
+    def _apply_status_message(self, message):
+        _, h, v, mode, signal_good, reading, feedback_source = message
+        self.h_var.set(f"{h:.4f}%")
+        self.v_var.set(f"{v:.4f}%")
+        if self._safe_focus_get() not in (self.target_h_entry, self.target_v_entry):
+            self.target_h_var.set(f"{h:.6g}")
+            self.target_v_var.set(f"{v:.6g}")
+        if self._manual_active and mode == ThorlabsModularNanoTrak.MODE_LATCH:
+            self.mode_var.set("Manual (latched)")
+        else:
+            self.mode_var.set(ThorlabsModularNanoTrak.MODE_NAMES.get(mode, f"Unknown ({mode})"))
+        self._feedback_source = feedback_source
+        state = "good" if signal_good else "bad"
+        if feedback_source == ThorlabsModularNanoTrak.FEEDBACK_TIA:
+            self.signal_label_var.set("Optical power (PIN/TIA):")
+            self.signal_var.set(f"{reading:.6g} ({state})")
+            display_signal_good = signal_good
+        else:
+            self.signal_label_var.set("BNC voltage:")
+            self.signal_var.set(f"{reading:.6g} V")
+            display_signal_good = None
+        self._update_tracking_grid(h, v, display_signal_good)
+
+    def _apply_setting_applied_message(self, message):
+        setting = message[1]
+        if setting == "radius":
+            self._track_radius_nt = message[2]
+            self.track_radius_var.set(f"{message[2]:.6g}")
+        elif setting == "frequency":
+            self.track_frequency_var.set(f"{message[2]:.6g}")
+        elif setting == "feedback":
+            source = message[2]
+            self._feedback_source = source
+            self.feedback_var.set(ThorlabsModularNanoTrak.FEEDBACK_NAMES[source])
+            if source == ThorlabsModularNanoTrak.FEEDBACK_TIA:
+                self.signal_label_var.set("Optical power (PIN/TIA):")
+            else:
+                self.signal_label_var.set("BNC voltage:")
+        elif setting == "phase":
+            self.phase_h_var.set(str(message[2]))
+            self.phase_v_var.set(str(message[3]))
+
+    def _apply_settings_message(self, message):
+        (
+            _,
+            feedback_source,
+            phase_h,
+            phase_v,
+            track_radius,
+            track_frequency,
+        ) = message
+        focused = self._safe_focus_get()
+        if focused not in (self.feedback_combo,):
+            self.feedback_var.set(
+                ThorlabsModularNanoTrak.FEEDBACK_NAMES.get(
+                    feedback_source, f"Unknown ({feedback_source})"
+                )
+            )
+        if focused not in (self.phase_h_entry, self.phase_v_entry):
+            self.phase_h_var.set(str(phase_h))
+            self.phase_v_var.set(str(phase_v))
+        self._track_radius_nt = track_radius
+        self._feedback_source = feedback_source
+        if focused is not self.track_radius_entry:
+            self.track_radius_var.set(f"{track_radius:.6g}")
+        if focused is not self.track_frequency_entry:
+            self.track_frequency_var.set(f"{track_frequency:.6g}")
+
     def _poll_queue(self):
         if self._closed:
             return
@@ -1008,89 +1078,16 @@ class NanoTrakControlWindow:
                 if kind == "connected":
                     self.status_var.set("Connected to rack NanoTrak.")
                 elif kind == "status":
-                    _, h, v, mode, signal_good, reading, feedback_source = message
-                    self.h_var.set(f"{h:.4f}%")
-                    self.v_var.set(f"{v:.4f}%")
-                    if self.top.focus_get() not in (self.target_h_entry, self.target_v_entry):
-                        self.target_h_var.set(f"{h:.6g}")
-                        self.target_v_var.set(f"{v:.6g}")
-                    if self._manual_active and mode == ThorlabsModularNanoTrak.MODE_LATCH:
-                        self.mode_var.set("Manual (latched)")
-                    else:
-                        self.mode_var.set(
-                            ThorlabsModularNanoTrak.MODE_NAMES.get(
-                                mode, f"Unknown ({mode})"
-                            )
-                        )
-                    self._feedback_source = feedback_source
-                    state = "good" if signal_good else "bad"
-                    if feedback_source == ThorlabsModularNanoTrak.FEEDBACK_TIA:
-                        self.signal_label_var.set("Optical power (PIN/TIA):")
-                        self.signal_var.set(f"{reading:.6g} ({state})")
-                        display_signal_good = signal_good
-                    else:
-                        self.signal_label_var.set("BNC voltage:")
-                        self.signal_var.set(f"{reading:.6g} V")
-                        display_signal_good = None
-                    self._update_tracking_grid(h, v, display_signal_good)
+                    self._apply_status_message(message)
                 elif kind == "manual_active":
                     self._manual_active = message[1]
                 elif kind == "setting_applied":
-                    setting = message[1]
-                    if setting == "radius":
-                        self._track_radius_nt = message[2]
-                        self.track_radius_var.set(f"{message[2]:.6g}")
-                    elif setting == "frequency":
-                        self.track_frequency_var.set(f"{message[2]:.6g}")
-                    elif setting == "feedback":
-                        source = message[2]
-                        self._feedback_source = source
-                        self.feedback_var.set(
-                            ThorlabsModularNanoTrak.FEEDBACK_NAMES[source]
-                        )
-                        if source == ThorlabsModularNanoTrak.FEEDBACK_TIA:
-                            self.signal_label_var.set("Optical power (PIN/TIA):")
-                        else:
-                            self.signal_label_var.set("BNC voltage:")
-                    elif setting == "channels":
-                        self.chan_a_var.set(str(message[2]))
-                        self.chan_b_var.set(str(message[3]))
-                    elif setting == "phase":
-                        self.phase_h_var.set(str(message[2]))
-                        self.phase_v_var.set(str(message[3]))
+                    self._apply_setting_applied_message(message)
                 elif kind == "motor_position":
                     self.motor_x_var.set(f"{message[1]:.6f}")
                     self.motor_y_var.set(f"{message[2]:.6f}")
                 elif kind == "settings":
-                    (
-                        _,
-                        feedback_source,
-                        chan_a,
-                        chan_b,
-                        phase_h,
-                        phase_v,
-                        track_radius,
-                        track_frequency,
-                    ) = message
-                    focused = self.top.focus_get()
-                    if focused not in (self.feedback_combo,):
-                        self.feedback_var.set(
-                            ThorlabsModularNanoTrak.FEEDBACK_NAMES.get(
-                                feedback_source, f"Unknown ({feedback_source})"
-                            )
-                        )
-                    if focused not in (self.chan_a_entry, self.chan_b_entry):
-                        self.chan_a_var.set(str(chan_a))
-                        self.chan_b_var.set(str(chan_b))
-                    if focused not in (self.phase_h_entry, self.phase_v_entry):
-                        self.phase_h_var.set(str(phase_h))
-                        self.phase_v_var.set(str(phase_v))
-                    self._track_radius_nt = track_radius
-                    self._feedback_source = feedback_source
-                    if focused is not self.track_radius_entry:
-                        self.track_radius_var.set(f"{track_radius:.6g}")
-                    if focused is not self.track_frequency_entry:
-                        self.track_frequency_var.set(f"{track_frequency:.6g}")
+                    self._apply_settings_message(message)
                 elif kind == "ready":
                     self.status_var.set("Ready.")
                     self._set_controls_enabled(True)
