@@ -37,7 +37,7 @@ from scan_engine import (
     run_jog_scan,
     run_scan,
 )
-from ThorlabsStepper import ThorlabsModularStepperController
+from ThorlabsStepper import DEFAULT_MOTOR_POLL_MS, ThorlabsModularStepperController
 from ThorlabsNanoTrak import ThorlabsModularNanoTrak
 
 SERIAL = "50865380"
@@ -50,7 +50,7 @@ ROW_SETTLE_S = 2.0
 READ_SAFETY_FACTOR = 1.10
 READ_OVERHEAD_S = 0.05
 SKIP_HOMING_CHECK = True
-HOME_TIMEOUT_S = 30.0
+HOME_TIMEOUT_S = 120.0
 
 REDRAW_INTERVAL_MS = 250
 DEFAULT_MAX_GRID_POINTS = 200
@@ -407,6 +407,11 @@ class NanoTrakControlWindow:
         label: key for key, label in ThorlabsModularNanoTrak.FEEDBACK_NAMES.items()
     }
     DEFAULT_TRACK_FREQUENCY_HZ = 18.0
+    DEFAULT_FEEDBACK_SOURCE = ThorlabsModularNanoTrak.FEEDBACK_BNC_5V
+    DEFAULT_PHASE_COMPENSATION_DEG = -31.5
+    POSITION_UNITS = ("µm", "nm", "%", "NT")
+    DEFAULT_POSITION_UNIT = "µm"
+    DEFAULT_MAX_TRAVEL_UM = 20.0
 
     def __init__(
         self,
@@ -433,8 +438,13 @@ class NanoTrakControlWindow:
         self._trace = []
         self._last_position = None
         self._track_radius_nt = None
+        self._max_travel_um = (
+            self.DEFAULT_MAX_TRAVEL_UM,
+            self.DEFAULT_MAX_TRAVEL_UM,
+        )
+        self._display_unit = self.DEFAULT_POSITION_UNIT
         self._manual_active = False
-        self._feedback_source = ThorlabsModularNanoTrak.FEEDBACK_TIA
+        self._feedback_source = self.DEFAULT_FEEDBACK_SOURCE
         self._command_queue = queue.Queue()
         self._result_queue = queue.Queue()
 
@@ -447,20 +457,26 @@ class NanoTrakControlWindow:
 
         self.h_var = tk.StringVar(value="--")
         self.v_var = tk.StringVar(value="--")
-        self.target_h_var = tk.StringVar(value="50.0")
-        self.target_v_var = tk.StringVar(value="50.0")
-        self.track_radius_var = tk.StringVar(value="0.5")
+        self.target_h_var = tk.StringVar(value="10.0")
+        self.target_v_var = tk.StringVar(value="10.0")
+        self.track_radius_var = tk.StringVar(value="--")
+        self.position_unit_var = tk.StringVar(value=self.DEFAULT_POSITION_UNIT)
+        self.max_travel_var = tk.StringVar(value="20.0")
+        self.radius_label_var = tk.StringVar(value="Track radius:")
+        self.scan_size_var = tk.StringVar(value="Scan diameter: --")
         self.track_frequency_var = tk.StringVar(value="18.0")
         self.mode_var = tk.StringVar(value="--")
-        self.signal_label_var = tk.StringVar(value="Optical power (PIN/TIA):")
+        self.signal_label_var = tk.StringVar(value="BNC voltage:")
         self.signal_var = tk.StringVar(value="--")
         self.offset_var = tk.StringVar(value="Offset from center: --")
         self.motor_x_var = tk.StringVar(value="--")
         self.motor_y_var = tk.StringVar(value="--")
         self.motor_step_var = tk.StringVar(value="0.01")
-        self.feedback_var = tk.StringVar(value=self.FEEDBACK_LABELS[0])
-        self.phase_h_var = tk.StringVar(value="0")
-        self.phase_v_var = tk.StringVar(value="0")
+        self.feedback_var = tk.StringVar(
+            value=ThorlabsModularNanoTrak.FEEDBACK_NAMES[self.DEFAULT_FEEDBACK_SOURCE]
+        )
+        self.phase_h_var = tk.StringVar(value=f"{self.DEFAULT_PHASE_COMPENSATION_DEG:g}")
+        self.phase_v_var = tk.StringVar(value=f"{self.DEFAULT_PHASE_COMPENSATION_DEG:g}")
         self.status_var = tk.StringVar(value="Connecting...")
         self._build_ui()
 
@@ -511,6 +527,33 @@ class NanoTrakControlWindow:
         )
         self.refresh_btn = ttk.Button(readback, text="Refresh", command=self._on_refresh)
         self.refresh_btn.grid(row=0, column=4, rowspan=2, padx=(10, 0))
+        ttk.Label(readback, text="Position unit:").grid(
+            row=0, column=5, sticky="e", padx=(14, 4)
+        )
+        self.position_unit_combo = ttk.Combobox(
+            readback,
+            textvariable=self.position_unit_var,
+            values=self.POSITION_UNITS,
+            state="readonly",
+            width=5,
+        )
+        self.position_unit_combo.grid(row=0, column=6, sticky="w")
+        self.position_unit_combo.bind(
+            "<<ComboboxSelected>>", self._on_position_unit_changed
+        )
+        ttk.Label(readback, text="Nominal travel (µm):").grid(
+            row=1, column=5, sticky="e", padx=(14, 4), pady=(5, 0)
+        )
+        self.max_travel_entry = ttk.Entry(
+            readback, textvariable=self.max_travel_var, width=7
+        )
+        self.max_travel_entry.grid(row=1, column=6, sticky="w", pady=(5, 0))
+        self.max_travel_apply_btn = ttk.Button(
+            readback, text="Use scale", command=self._on_apply_max_travel
+        )
+        self.max_travel_apply_btn.grid(
+            row=1, column=7, sticky="w", padx=(4, 0), pady=(5, 0)
+        )
 
         tracking = ttk.LabelFrame(frame, text="Live NanoTrak H/V grid", padding=8)
         tracking.grid(row=1, column=0, rowspan=4, sticky="n", padx=(0, 8), pady=(0, 8))
@@ -532,15 +575,25 @@ class NanoTrakControlWindow:
         self.clear_trace_btn.grid(row=1, column=1, sticky="e", pady=(6, 0))
         self._draw_tracking_grid()
 
-        target = ttk.LabelFrame(frame, text="Piezo position (% of range)", padding=8)
-        target.grid(row=1, column=1, sticky="ew", pady=(0, 8))
-        ttk.Label(target, text="Horizontal").grid(row=0, column=0, sticky="w")
-        self.target_h_entry = ttk.Entry(target, textvariable=self.target_h_var, width=10)
+        self.target_frame = ttk.LabelFrame(frame, text="Circle center target", padding=8)
+        self.target_frame.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        ttk.Label(self.target_frame, text="Horizontal").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.target_h_entry = ttk.Entry(
+            self.target_frame, textvariable=self.target_h_var, width=10
+        )
         self.target_h_entry.grid(row=0, column=1, padx=(6, 12))
-        ttk.Label(target, text="Vertical").grid(row=0, column=2, sticky="w")
-        self.target_v_entry = ttk.Entry(target, textvariable=self.target_v_var, width=10)
+        ttk.Label(self.target_frame, text="Vertical").grid(
+            row=0, column=2, sticky="w"
+        )
+        self.target_v_entry = ttk.Entry(
+            self.target_frame, textvariable=self.target_v_var, width=10
+        )
         self.target_v_entry.grid(row=0, column=3, padx=(6, 12))
-        self.set_btn = ttk.Button(target, text="Set", command=self._on_set_position)
+        self.set_btn = ttk.Button(
+            self.target_frame, text="Set center", command=self._on_set_position
+        )
         self.set_btn.grid(row=0, column=4)
 
         modes = ttk.LabelFrame(frame, text="Piezo mode and tracking", padding=8)
@@ -557,7 +610,7 @@ class NanoTrakControlWindow:
             button.grid(row=0, column=column, padx=3, sticky="ew")
             modes.columnconfigure(column, weight=1)
             self.mode_buttons.append(button)
-        ttk.Label(modes, text="NT track radius (0–5):").grid(
+        ttk.Label(modes, textvariable=self.radius_label_var).grid(
             row=1, column=0, sticky="w", padx=3, pady=(8, 0)
         )
         self.track_radius_entry = ttk.Entry(
@@ -583,6 +636,9 @@ class NanoTrakControlWindow:
         self.frequency_apply_btn.grid(
             row=2, column=2, sticky="ew", padx=3, pady=(6, 0)
         )
+        ttk.Label(modes, textvariable=self.scan_size_var).grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=3, pady=(6, 0)
+        )
 
         settings = ttk.LabelFrame(frame, text="Piezo / NanoTrak settings", padding=8)
         settings.grid(row=3, column=1, sticky="ew", pady=(0, 8))
@@ -600,10 +656,10 @@ class NanoTrakControlWindow:
         )
         self.feedback_apply_btn.grid(row=0, column=3)
 
-        ttk.Label(settings, text="Phase H:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(settings, text="Phase H (deg):").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.phase_h_entry = ttk.Entry(settings, textvariable=self.phase_h_var, width=6)
         self.phase_h_entry.grid(row=1, column=1, padx=(6, 12), pady=(6, 0), sticky="w")
-        ttk.Label(settings, text="Phase V:").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(settings, text="Phase V (deg):").grid(row=1, column=2, sticky="w", pady=(6, 0))
         self.phase_v_entry = ttk.Entry(settings, textvariable=self.phase_v_var, width=6)
         self.phase_v_entry.grid(row=1, column=3, padx=(6, 0), pady=(6, 0), sticky="w")
         self.phase_apply_btn = ttk.Button(
@@ -655,12 +711,196 @@ class NanoTrakControlWindow:
             *self.mode_buttons,
             *(self.motor_jog_buttons if self.include_motor_controls else []),
         ]
+        self._refresh_unit_labels()
         self._set_controls_enabled(False)
 
     def _set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
         for widget in self._busy_widgets:
             widget.configure(state=state)
+
+    @staticmethod
+    def _format_piezo_value(value):
+        return f"{value:.6g}"
+
+    def _percent_to_unit(self, percent, axis, unit=None):
+        unit = unit or self._display_unit
+        percent = float(percent)
+        if unit == "%":
+            return percent
+        if unit == "NT":
+            return percent / 10.0
+        if self._max_travel_um is None:
+            raise ValueError("Piezo travel has not been read from the hardware yet.")
+        value_um = percent * self._max_travel_um[axis] / 100.0
+        return value_um * 1000.0 if unit == "nm" else value_um
+
+    def _unit_to_percent(self, value, axis, unit=None):
+        unit = unit or self._display_unit
+        value = float(value)
+        if unit == "%":
+            return value
+        if unit == "NT":
+            return value * 10.0
+        if self._max_travel_um is None:
+            raise ValueError("Piezo travel has not been read from the hardware yet.")
+        value_um = value / 1000.0 if unit == "nm" else value
+        return 100.0 * value_um / self._max_travel_um[axis]
+
+    def _radius_nt_to_unit(self, radius_nt, unit=None):
+        """Convert the normalized radius using the shared nominal travel."""
+        unit = unit or self._display_unit
+        return self._percent_to_unit(float(radius_nt) * 10.0, 0, unit)
+
+    def _unit_to_radius_nt(self, value, unit=None):
+        unit = unit or self._display_unit
+        return self._unit_to_percent(value, 0, unit) / 10.0
+
+    def _unit_maximum(self, axis=0, unit=None):
+        return self._percent_to_unit(100.0, axis, unit)
+
+    def _refresh_unit_labels(self):
+        unit = self._display_unit
+        self.target_frame.configure(text=f"Circle center target ({unit})")
+        try:
+            radius_max = self._radius_nt_to_unit(
+                ThorlabsModularNanoTrak.TRACK_RADIUS_MAX_NT, unit
+            )
+            maximum_text = self._format_piezo_value(radius_max)
+        except ValueError:
+            maximum_text = "--"
+        self.radius_label_var.set(f"Track radius (0–{maximum_text} {unit}):")
+
+    def _refresh_scan_size(self):
+        if self._track_radius_nt is None or self._max_travel_um is None:
+            self.scan_size_var.set("Scan diameter: --")
+            return
+        diameter_h_um = (
+            2.0 * self._track_radius_nt * self._max_travel_um[0] / 10.0
+        )
+        diameter_v_um = (
+            2.0 * self._track_radius_nt * self._max_travel_um[1] / 10.0
+        )
+        if self._display_unit == "nm":
+            diameter_h = diameter_h_um * 1000.0
+            diameter_v = diameter_v_um * 1000.0
+            unit = "nm"
+        else:
+            diameter_h = diameter_h_um
+            diameter_v = diameter_v_um
+            unit = "µm"
+        self.scan_size_var.set(
+            "Physical scan diameter H × V: "
+            f"{self._format_piezo_value(diameter_h)} × "
+            f"{self._format_piezo_value(diameter_v)} {unit}"
+        )
+
+    def _refresh_unit_values(self):
+        self._refresh_unit_labels()
+        self._draw_tracking_grid()
+        if self._last_position is not None:
+            h, v = self._last_position
+            self.h_var.set(
+                f"{self._format_piezo_value(self._percent_to_unit(h, 0))} {self._display_unit}"
+            )
+            self.v_var.set(
+                f"{self._format_piezo_value(self._percent_to_unit(v, 1))} {self._display_unit}"
+            )
+        if self._track_radius_nt is not None:
+            self.track_radius_var.set(
+                self._format_piezo_value(
+                    self._radius_nt_to_unit(self._track_radius_nt)
+                )
+            )
+        self._refresh_scan_size()
+
+    def _on_position_unit_changed(self, _event=None):
+        new_unit = self.position_unit_var.get()
+        old_unit = self._display_unit
+        if new_unit == old_unit:
+            return
+        try:
+            if new_unit in ("µm", "nm") and self._max_travel_um is None:
+                raise ValueError("Physical units require valid piezo travel from NanoTrak.")
+            target_percent = (
+                self._unit_to_percent(self.target_h_var.get(), 0, old_unit),
+                self._unit_to_percent(self.target_v_var.get(), 1, old_unit),
+            )
+            radius_entry_nt = None
+            if self._track_radius_nt is not None:
+                radius_entry_nt = self._unit_to_radius_nt(
+                    self.track_radius_var.get(), old_unit
+                )
+        except ValueError as exc:
+            self.position_unit_var.set(old_unit)
+            messagebox.showerror("Cannot change piezo unit", str(exc), parent=self.top)
+            return
+
+        self._display_unit = new_unit
+        self.target_h_var.set(
+            self._format_piezo_value(
+                self._percent_to_unit(target_percent[0], 0, new_unit)
+            )
+        )
+        self.target_v_var.set(
+            self._format_piezo_value(
+                self._percent_to_unit(target_percent[1], 1, new_unit)
+            )
+        )
+        self._refresh_unit_values()
+        if radius_entry_nt is not None:
+            # Preserve a pending radius edit across a unit change without
+            # pretending that it has already been applied to the device.
+            self.track_radius_var.set(
+                self._format_piezo_value(
+                    self._radius_nt_to_unit(radius_entry_nt, new_unit)
+                )
+            )
+
+    def _on_apply_max_travel(self):
+        try:
+            max_travel_um = float(self.max_travel_var.get())
+            if max_travel_um <= 0:
+                raise ValueError
+            target_percent = (
+                self._unit_to_percent(self.target_h_var.get(), 0),
+                self._unit_to_percent(self.target_v_var.get(), 1),
+            )
+            radius_entry_nt = None
+            if self._track_radius_nt is not None:
+                radius_entry_nt = self._unit_to_radius_nt(
+                    self.track_radius_var.get()
+                )
+        except ValueError:
+            messagebox.showerror(
+                "Invalid nominal travel",
+                "Nominal piezo travel must be a positive number in µm. "
+                "The current center and radius entries must also be valid.",
+                parent=self.top,
+            )
+            return
+
+        # This is a local display/input scale only. No calibration or travel
+        # command is sent to the NanoTrak or its piezo channels.
+        self._max_travel_um = (max_travel_um, max_travel_um)
+        self.max_travel_var.set(self._format_piezo_value(max_travel_um))
+        self.target_h_var.set(
+            self._format_piezo_value(
+                self._percent_to_unit(target_percent[0], 0)
+            )
+        )
+        self.target_v_var.set(
+            self._format_piezo_value(
+                self._percent_to_unit(target_percent[1], 1)
+            )
+        )
+        self._refresh_unit_values()
+        if radius_entry_nt is not None:
+            self.track_radius_var.set(
+                self._format_piezo_value(
+                    self._radius_nt_to_unit(radius_entry_nt)
+                )
+            )
 
     def _draw_tracking_grid(self):
         canvas = self.tracking_canvas
@@ -677,10 +917,19 @@ class NanoTrakControlWindow:
             canvas.create_line(x, top, x, bottom, fill=color, width=width, tags="grid")
             canvas.create_line(left, y, right, y, fill=color, width=width, tags="grid")
             if value % 20 == 0:
+                try:
+                    horizontal_label = self._format_piezo_value(
+                        self._percent_to_unit(value, 0)
+                    )
+                    vertical_label = self._format_piezo_value(
+                        self._percent_to_unit(value, 1)
+                    )
+                except ValueError:
+                    horizontal_label = vertical_label = str(value)
                 canvas.create_text(
                     x,
                     bottom + 12,
-                    text=str(value),
+                    text=horizontal_label,
                     fill="#c5d2d9",
                     font=("TkDefaultFont", 7),
                     tags="grid",
@@ -688,18 +937,22 @@ class NanoTrakControlWindow:
                 canvas.create_text(
                     left - 15,
                     y,
-                    text=str(value),
+                    text=vertical_label,
                     fill="#c5d2d9",
                     font=("TkDefaultFont", 7),
                     tags="grid",
                 )
         canvas.create_text(
-            (left + right) / 2, 276, text="Horizontal piezo (%)", fill="#e2edf2", tags="grid"
+            (left + right) / 2,
+            276,
+            text=f"Horizontal piezo ({self._display_unit})",
+            fill="#e2edf2",
+            tags="grid",
         )
         canvas.create_text(
             9,
             (top + bottom) / 2,
-            text="Vertical piezo (%)",
+            text=f"Vertical piezo ({self._display_unit})",
             angle=90,
             fill="#e2edf2",
             tags="grid",
@@ -749,7 +1002,11 @@ class NanoTrakControlWindow:
                 right - 4,
                 top + 8,
                 anchor="ne",
-                text=f"Radius {self._track_radius_nt:.3g} NT",
+                text=(
+                    "Radius H="
+                    f"{self._format_piezo_value(self._radius_nt_to_unit(self._track_radius_nt))} "
+                    f"{self._display_unit}"
+                ),
                 fill="#fbbf24",
                 tags="track_radius",
             )
@@ -760,8 +1017,15 @@ class NanoTrakControlWindow:
         canvas.create_line(x - 8, y, x + 8, y, fill=marker, width=2, tags="tracking")
         canvas.create_line(x, y - 8, x, y + 8, fill=marker, width=2, tags="tracking")
         canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=marker, width=2, tags="tracking")
+        offset_h = self._percent_to_unit(horizontal - 50.0, 0)
+        offset_v = self._percent_to_unit(vertical - 50.0, 1)
+        # Fixed width + 2 sig figs so this label's rendered length stays
+        # constant as the value changes -- otherwise the grid column it
+        # sits in keeps resizing and shoves the adjacent subwindow around.
         self.offset_var.set(
-            f"Offset from center: H={horizontal - 50.0:+.3f}%, V={vertical - 50.0:+.3f}%"
+            "Offset from mid-travel: "
+            f"H={offset_h:+7.2g} {self._display_unit}, "
+            f"V={offset_v:+7.2g} {self._display_unit}"
         )
 
     def _clear_tracking_trace(self):
@@ -816,9 +1080,17 @@ class NanoTrakControlWindow:
     def _cmd_connect(self, command):
         self.controller = ThorlabsModularNanoTrak(self.nanotrak_serial, poll_ms=50)
         self.controller.connect()
-        # connect() already defaults to Latch mode; frequency has no such
-        # device-side default, so pin it here to this app's preferred value.
+        # connect() already defaults to Latch mode (manual); the remaining
+        # settings have no such device-side default, so pin them here to
+        # this app's preferred values. Frequency must be set before phase
+        # compensation, since the phase raw value is computed from the
+        # current samples-per-revolution (i.e. from the track frequency).
         self.controller.set_track_frequency_hz(self.DEFAULT_TRACK_FREQUENCY_HZ)
+        self.controller.set_feedback_source(self.DEFAULT_FEEDBACK_SOURCE)
+        self.controller.set_phase_compensation(
+            self.DEFAULT_PHASE_COMPENSATION_DEG, self.DEFAULT_PHASE_COMPENSATION_DEG
+        )
+        self._result_queue.put(("manual_active", True))
         if self.include_motor_controls:
             self._connect_motors()
         self._connected = True
@@ -928,15 +1200,26 @@ class NanoTrakControlWindow:
 
     def _on_set_position(self):
         try:
-            h = float(self.target_h_var.get())
-            v = float(self.target_v_var.get())
+            h_display = float(self.target_h_var.get())
+            v_display = float(self.target_v_var.get())
+            h = self._unit_to_percent(h_display, 0)
+            v = self._unit_to_percent(v_display, 1)
         except ValueError:
             messagebox.showerror(
-                "Invalid input", "Horizontal and vertical targets must be numbers."
+                "Invalid input",
+                "Horizontal and vertical targets must be valid numbers in "
+                f"{self._display_unit}.",
             )
             return
         if not (0 <= h <= 100 and 0 <= v <= 100):
-            messagebox.showerror("Invalid input", "Piezo targets must be between 0% and 100%.")
+            maximum_h = self._format_piezo_value(self._unit_maximum(0))
+            maximum_v = self._format_piezo_value(self._unit_maximum(1))
+            messagebox.showerror(
+                "Invalid input",
+                "Circle center targets must be within the piezo travel: "
+                f"H=0–{maximum_h} {self._display_unit}, "
+                f"V=0–{maximum_v} {self._display_unit}.",
+            )
             return
         self._send(("set_position", h, v))
 
@@ -945,15 +1228,23 @@ class NanoTrakControlWindow:
 
     def _on_set_track_radius(self):
         try:
-            radius = float(self.track_radius_var.get())
+            radius_display = float(self.track_radius_var.get())
+            radius = self._unit_to_radius_nt(radius_display)
         except ValueError:
-            messagebox.showerror("Invalid input", "NT track radius must be a number.")
+            messagebox.showerror(
+                "Invalid input",
+                f"Track radius must be a valid number in {self._display_unit}.",
+            )
             return
         max_radius = ThorlabsModularNanoTrak.TRACK_RADIUS_MAX_NT
         if not 0 <= radius <= max_radius:
+            maximum_display = self._format_piezo_value(
+                self._radius_nt_to_unit(max_radius)
+            )
             messagebox.showerror(
                 "Invalid input",
-                f"NT track radius must be between 0 and {max_radius:g} NT units.",
+                "Track radius must be between 0 and "
+                f"{maximum_display} {self._display_unit}.",
             )
             return
         self._send(("set_track_radius", radius))
@@ -982,10 +1273,10 @@ class NanoTrakControlWindow:
 
     def _on_apply_phase(self):
         try:
-            phase_h = int(self.phase_h_var.get())
-            phase_v = int(self.phase_v_var.get())
+            phase_h = float(self.phase_h_var.get())
+            phase_v = float(self.phase_v_var.get())
         except ValueError:
-            messagebox.showerror("Invalid input", "Phase H/V must be integers.")
+            messagebox.showerror("Invalid input", "Phase H/V must be numbers (degrees).")
             return
         self._send(("set_phase_compensation", phase_h, phase_v))
 
@@ -1002,11 +1293,18 @@ class NanoTrakControlWindow:
 
     def _apply_status_message(self, message):
         _, h, v, mode, signal_good, reading, feedback_source = message
-        self.h_var.set(f"{h:.4f}%")
-        self.v_var.set(f"{v:.4f}%")
-        if self._safe_focus_get() not in (self.target_h_entry, self.target_v_entry):
-            self.target_h_var.set(f"{h:.6g}")
-            self.target_v_var.set(f"{v:.6g}")
+        self.h_var.set(
+            f"{self._format_piezo_value(self._percent_to_unit(h, 0))} "
+            f"{self._display_unit}"
+        )
+        self.v_var.set(
+            f"{self._format_piezo_value(self._percent_to_unit(v, 1))} "
+            f"{self._display_unit}"
+        )
+        # The center target is a user-entered command, not another live
+        # readback. Keep it unchanged while polling updates the current H/V
+        # values above, so the requested center remains available until the
+        # user deliberately edits it and presses "Set center" again.
         if self._manual_active and mode == ThorlabsModularNanoTrak.MODE_LATCH:
             self.mode_var.set("Manual (latched)")
         else:
@@ -1027,7 +1325,12 @@ class NanoTrakControlWindow:
         setting = message[1]
         if setting == "radius":
             self._track_radius_nt = message[2]
-            self.track_radius_var.set(f"{message[2]:.6g}")
+            self.track_radius_var.set(
+                self._format_piezo_value(
+                    self._radius_nt_to_unit(self._track_radius_nt)
+                )
+            )
+            self._refresh_scan_size()
         elif setting == "frequency":
             self.track_frequency_var.set(f"{message[2]:.6g}")
         elif setting == "feedback":
@@ -1039,8 +1342,8 @@ class NanoTrakControlWindow:
             else:
                 self.signal_label_var.set("BNC voltage:")
         elif setting == "phase":
-            self.phase_h_var.set(str(message[2]))
-            self.phase_v_var.set(str(message[3]))
+            self.phase_h_var.set(f"{message[2]:.6g}")
+            self.phase_v_var.set(f"{message[3]:.6g}")
 
     def _apply_settings_message(self, message):
         (
@@ -1059,14 +1362,21 @@ class NanoTrakControlWindow:
                 )
             )
         if focused not in (self.phase_h_entry, self.phase_v_entry):
-            self.phase_h_var.set(str(phase_h))
-            self.phase_v_var.set(str(phase_v))
+            self.phase_h_var.set(f"{phase_h:.6g}")
+            self.phase_v_var.set(f"{phase_v:.6g}")
         self._track_radius_nt = track_radius
         self._feedback_source = feedback_source
         if focused is not self.track_radius_entry:
-            self.track_radius_var.set(f"{track_radius:.6g}")
+            self.track_radius_var.set(
+                self._format_piezo_value(
+                    self._radius_nt_to_unit(self._track_radius_nt)
+                )
+            )
         if focused is not self.track_frequency_entry:
             self.track_frequency_var.set(f"{track_frequency:.6g}")
+        self._refresh_unit_labels()
+        self._draw_tracking_grid()
+        self._refresh_scan_size()
 
     def _poll_queue(self):
         if self._closed:
@@ -1219,8 +1529,16 @@ class ScanGUI:
         """
         with self._motor_connect_lock:
             if self.motorx is None:
-                motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
-                motory = ThorlabsModularStepperController(serial=SERIAL, channel=2, poll_ms=1)
+                motorx = ThorlabsModularStepperController(
+                    serial=SERIAL,
+                    channel=1,
+                    poll_ms=DEFAULT_MOTOR_POLL_MS,
+                )
+                motory = ThorlabsModularStepperController(
+                    serial=SERIAL,
+                    channel=2,
+                    poll_ms=DEFAULT_MOTOR_POLL_MS,
+                )
                 motorx.connect()
                 motory.connect()
                 self.motorx = motorx

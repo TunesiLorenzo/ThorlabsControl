@@ -23,7 +23,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ArduinoSampler import burst_read_binary, close_arduino, open_arduino
-from ThorlabsStepper import ThorlabsError, ThorlabsModularStepperController
+from ThorlabsStepper import (
+    DEFAULT_MOTOR_POLL_MS,
+    ThorlabsError,
+    ThorlabsModularStepperController,
+)
 from motion_timing import (
     expected_move_time,
     make_mapping,
@@ -52,7 +56,7 @@ read_overhead_s = 0.05
 extra_pre_burst_delay_s = 0.0  # set to e.g. 0.3 to intentionally lose more X
 
 # Safety / setup
-home_timeout_s = 30.0
+home_timeout_s = 120.0
 skip_homing_check = True  # only skip if X is already homed
 move_tolerance_mm = 0.05
 
@@ -181,7 +185,11 @@ def acquire_line():
     """Move X across one span while acquiring one clean Arduino burst."""
     x_target_start = x0 - x_span / 2.0
     x_displacement = x_span
-    motorx = ThorlabsModularStepperController(serial=SERIAL, channel=1, poll_ms=1)
+    motorx = ThorlabsModularStepperController(
+        serial=SERIAL,
+        channel=1,
+        poll_ms=DEFAULT_MOTOR_POLL_MS,
+    )
     ser = None
     failed = True
 

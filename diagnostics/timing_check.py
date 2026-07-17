@@ -34,7 +34,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ArduinoSampler import burst_read_binary, close_arduino, open_arduino
-from ThorlabsStepper import ThorlabsError, ThorlabsModularStepperController
+from ThorlabsStepper import (
+    DEFAULT_MOTOR_POLL_MS,
+    ThorlabsError,
+    ThorlabsModularStepperController,
+)
 from motion_timing import (
     MoveStartLagMonitor,
     expected_move_time,
@@ -65,7 +69,7 @@ ROW_SETTLE_S = 0.5
 STOP_DELTA_WARN_S = 0.0  # flag any trial where the burst stopped before the motor did
 
 SKIP_HOMING_CHECK = True
-HOME_TIMEOUT_S = 30.0
+HOME_TIMEOUT_S = 120.0
 
 
 def require_homed(motor):
@@ -156,7 +160,11 @@ def run_trial(motorx, ser, trial_index, x_displacement, move_time, read_duration
 
 
 def main():
-    motorx = ThorlabsModularStepperController(serial=SERIAL, channel=CHANNEL, poll_ms=1)
+    motorx = ThorlabsModularStepperController(
+        serial=SERIAL,
+        channel=CHANNEL,
+        poll_ms=DEFAULT_MOTOR_POLL_MS,
+    )
     ser = None
     failed = True
     results = []

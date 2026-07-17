@@ -12,7 +12,11 @@ from motion_timing import (
     sample_positions_for_motion,
     sampling_duration_for_move,
 )
-from ThorlabsStepper import ThorlabsError, ThorlabsModularStepperController
+from ThorlabsStepper import (
+    DEFAULT_MOTOR_POLL_MS,
+    ThorlabsError,
+    ThorlabsModularStepperController,
+)
 
 # Below this fraction of the commanded X span captured, run_scan() prints a
 # per-row warning (see the coverage spot-check at the end of its row loop).
@@ -274,12 +278,12 @@ def plot_scan(scan_rows):
     plt.show()
 
 
-def check_connection_and_home(motorx, motory, home_timeout_s: float = 30.0):
+def check_connection_and_home(motorx, motory, home_timeout_s: float = 120.0):
     print("Checking motor connections...")
     for label, motor in (("X", motorx), ("Y", motory)):
         motor.request_update()
         status = motor.get_status_bits()
-        position = motor.get_position(real_unit=True)
+        position = motor.get_position(real_unit=True, refresh=False)
         print(
             f"{label} connected: "
             f"status=0x{status:08X}, "
@@ -297,7 +301,15 @@ def check_connection_and_home(motorx, motory, home_timeout_s: float = 30.0):
         if not status & 0x00000400:
             raise ThorlabsError(f"{label} axis did not report homed")
 
-        print(f"{label} homed at position {motor.get_position(real_unit=True):.6f}")
+        print(
+            f"{label} homed at position "
+            f"{motor.get_position(real_unit=True, refresh=False):.6f}"
+        )
+
+        # Both axes share one rack/USB link. Give it a quiet interval before
+        # the next channel's home command instead of following the final
+        # readback immediately with another long-running command.
+        time.sleep(0.25)
 
     print("Connection and homing check complete.")
 
@@ -416,7 +428,7 @@ def run_scan(
     row_settle_s=2.0,
     read_safety_factor=1.10,
     read_overhead_s=0.05,
-    home_timeout_s=30.0,
+    home_timeout_s=120.0,
     skip_homing_check=True,
     # Position-based move-start-lag detection (see motion_timing.MoveStartLagMonitor).
     move_start_lag_threshold_mm=0.0000005,  # 0.5 nm; must exceed quantization noise
@@ -475,12 +487,12 @@ def run_scan(
             motorx = ThorlabsModularStepperController(
                 serial=serial,
                 channel=1,
-                poll_ms=1,
+                poll_ms=DEFAULT_MOTOR_POLL_MS,
             )
             motory = ThorlabsModularStepperController(
                 serial=serial,
                 channel=2,
-                poll_ms=1,
+                poll_ms=DEFAULT_MOTOR_POLL_MS,
             )
             motorx.connect()
             motory.connect()
@@ -724,7 +736,7 @@ def run_jog_scan(
     acceleration,
     max_velocity,
     sample_duration_s=0.05,
-    home_timeout_s=30.0,
+    home_timeout_s=120.0,
     skip_homing_check=True,
     save_file=None,
     progress_callback=None,
@@ -771,8 +783,16 @@ def run_jog_scan(
 
     try:
         if owns_motors:
-            motorx = ThorlabsModularStepperController(serial=serial, channel=1, poll_ms=1)
-            motory = ThorlabsModularStepperController(serial=serial, channel=2, poll_ms=1)
+            motorx = ThorlabsModularStepperController(
+                serial=serial,
+                channel=1,
+                poll_ms=DEFAULT_MOTOR_POLL_MS,
+            )
+            motory = ThorlabsModularStepperController(
+                serial=serial,
+                channel=2,
+                poll_ms=DEFAULT_MOTOR_POLL_MS,
+            )
             motorx.connect()
             motory.connect()
 

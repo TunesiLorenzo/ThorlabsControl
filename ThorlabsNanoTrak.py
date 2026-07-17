@@ -172,7 +172,11 @@ class ThorlabsModularNanoTrak:
         # to drive (NT_SetNTChannels/chanA,chanB) -- not a hardcoded 1/2,
         # which would silently leave the real output channels disabled if
         # the device is wired/configured to use different channel numbers.
+        # A channel number of 0 means "unused" (e.g. a single-axis setup);
+        # NT_ChannelEnable rejects it with FT_InvalidParameter, so skip it.
         for channel in self.get_nt_channels():
+            if channel == 0:
+                continue
             check_zero(
                 self.dll.NT_ChannelEnable(self.serial, channel, True),
                 f"NT_ChannelEnable(channel={channel})",
@@ -387,14 +391,17 @@ class ThorlabsModularNanoTrak:
         )
         return radius
 
-    def get_track_frequency_hz(self):
+    def get_track_frequency_samples(self):
         params = self._get_circle_params()
         samples = int(params.samplesPerRevolution)
         if samples <= 0:
             raise ThorlabsError(
                 f"NanoTrak returned an invalid samples-per-revolution value: {samples}."
             )
-        return self.CIRCLE_SAMPLE_RATE_HZ / samples
+        return samples
+
+    def get_track_frequency_hz(self):
+        return self.CIRCLE_SAMPLE_RATE_HZ / self.get_track_frequency_samples()
 
     def set_track_frequency_hz(self, frequency_hz):
         """Set frequency, quantized to the device's four-sample resolution."""
@@ -441,8 +448,29 @@ class ThorlabsModularNanoTrak:
         return chan_a, chan_b
 
     # ---------------------------------------------------- phase compensation
+    #
+    # Per the Kinesis NanoTrak header (NT_SetPhaseCompensationParams):
+    #   raw value (0-65535) = phase(degrees) * samplesPerRevolution / 360
+    # i.e. the raw counts are a sample-offset within the scan circle, so
+    # they are only meaningful relative to the *current* track frequency
+    # (which sets samplesPerRevolution). Converting through degrees here
+    # keeps a requested phase (e.g. Kinesis-calibrated -31.5 degrees)
+    # correct even if the track frequency changes later.
+
+    @staticmethod
+    def _phase_degrees_to_raw(degrees, samples):
+        degrees_mod = float(degrees) % 360.0
+        return int(round(degrees_mod * samples / 360.0)) % (ThorlabsModularNanoTrak.DEVICE_MAX + 1)
+
+    @staticmethod
+    def _phase_raw_to_degrees(raw, samples):
+        degrees = (int(raw) * 360.0 / samples) % 360.0
+        if degrees > 180.0:
+            degrees -= 360.0
+        return degrees
 
     def get_phase_compensation(self):
+        """Return (horizontal, vertical) phase compensation in degrees (-180 to 180)."""
         self._request(
             self.dll.NT_RequestPhaseCompensationParams,
             "NT_RequestPhaseCompensationParams",
@@ -452,14 +480,23 @@ class ThorlabsModularNanoTrak:
             self.dll.NT_GetPhaseCompensationParams(self.serial, byref(value)),
             "NT_GetPhaseCompensationParams",
         )
-        return int(value.horizontalComponent), int(value.verticalComponent)
+        samples = self.get_track_frequency_samples()
+        return (
+            self._phase_raw_to_degrees(value.horizontalComponent, samples),
+            self._phase_raw_to_degrees(value.verticalComponent, samples),
+        )
 
     def set_phase_compensation(self, horizontal, vertical):
-        horizontal = int(horizontal)
-        vertical = int(vertical)
-        value = NT_HVComponent(horizontal, vertical)
+        """Set (horizontal, vertical) phase compensation in degrees."""
+        samples = self.get_track_frequency_samples()
+        h_raw = self._phase_degrees_to_raw(horizontal, samples)
+        v_raw = self._phase_degrees_to_raw(vertical, samples)
+        value = NT_HVComponent(h_raw, v_raw)
         check_zero(
             self.dll.NT_SetPhaseCompensationParams(self.serial, byref(value)),
             "NT_SetPhaseCompensationParams",
         )
-        return horizontal, vertical
+        return (
+            self._phase_raw_to_degrees(h_raw, samples),
+            self._phase_raw_to_degrees(v_raw, samples),
+        )

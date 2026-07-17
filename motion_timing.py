@@ -373,6 +373,14 @@ class MoveStartLagMonitor:
         self.timeout_s = timeout_s
         self.watch_for_stop = watch_for_stop
         self.stop_confirm_s = stop_confirm_s
+        # The DLL cache only changes at the controller polling rate. Reading
+        # it in a no-sleep Python loop adds CPU/DLL contention without adding
+        # timing information, especially while another thread issues the
+        # move command. Sample the cache a few times per controller poll.
+        self.cache_read_interval_s = max(
+            0.001,
+            min(0.005, self.motor.get_status_poll_interval_s() / 4.0),
+        )
 
         self.last_unchanged_t = None
         self.first_changed_t = None
@@ -427,6 +435,8 @@ class MoveStartLagMonitor:
                         # closer to the real stop instant.
                         self.motion_stopped_t = self._not_moving_since
                         return
+
+            self._stop_event.wait(self.cache_read_interval_s)
 
     def join(self, timeout=None):
         if self._thread is not None:

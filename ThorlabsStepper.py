@@ -20,6 +20,20 @@ from ctypes import (
 
 KINESIS_DIR = r"C:\Program Files\Thorlabs\Kinesis"
 
+# A 1 ms polling period is unnecessarily aggressive for a two-channel rack:
+# it creates 2,000 polling cycles/second before any application commands are
+# sent. 20 ms still gives the scan timing code a useful 50 Hz cache update
+# while leaving substantially more USB/controller bandwidth for commands.
+DEFAULT_MOTOR_POLL_MS = 20
+MIN_MOTOR_POLL_MS = 10
+
+# Kinesis calls are asynchronous at the hardware boundary. These short gaps
+# let the rack consume configuration and motion commands before Python sends
+# the next command. The longer enable delay follows Thorlabs' startup example.
+ENABLE_SETTLE_S = 0.5
+COMMAND_SETTLE_S = 0.05
+MOTION_COMMAND_SETTLE_S = 0.10
+
 
 class ThorlabsError(RuntimeError):
     pass
@@ -110,13 +124,19 @@ class ThorlabsModularStepperController:
         serial: str,
         channel: int,
         kinesis_dir: str = KINESIS_DIR,
-        poll_ms: int = 400,
+        poll_ms: int = DEFAULT_MOTOR_POLL_MS,
     ):
         self.serial_str = str(serial)
         self.serial = self.serial_str.encode("ascii")
         self.channel = int(channel)
         self.kinesis_dir = kinesis_dir
         self.poll_ms = int(poll_ms)
+
+        if self.poll_ms < MIN_MOTOR_POLL_MS:
+            raise ValueError(
+                f"poll_ms must be at least {MIN_MOTOR_POLL_MS} ms; "
+                "shorter periods can overload a multi-channel controller"
+            )
 
         if self.channel not in (1, 2):
             raise ValueError("channel must be 1 or 2")
@@ -257,33 +277,32 @@ class ThorlabsModularStepperController:
                 f"Invalid channel {self.channel} for serial {self.serial_str}"
             )
 
-        check_zero(
-            self.dll.SBC_EnableChannel(self.serial, self.channel),
-            "SBC_EnableChannel",
-        )
-        self._enabled = True
-
         ok = self.dll.SBC_StartPolling(self.serial, self.channel, self.poll_ms)
         if not ok:
             raise ThorlabsError("SBC_StartPolling failed")
         self._polling = True
         self._actual_poll_ms = self.get_polling_duration()
 
-        time.sleep(1.0)
+        check_zero(
+            self.dll.SBC_EnableChannel(self.serial, self.channel),
+            "SBC_EnableChannel",
+        )
+        self._enabled = True
+
+        # Enabling is asynchronous. Do not send home/move/settings commands
+        # until the controller has had time to enable the channel.
+        time.sleep(ENABLE_SETTLE_S)
 
         check_zero(
             self.dll.SBC_RequestSettings(self.serial, self.channel),
             "SBC_RequestSettings",
         )
-        check_zero(
-            self.dll.SBC_RequestStatusBits(self.serial, self.channel),
-            "SBC_RequestStatusBits",
-        )
-        check_zero(
-            self.dll.SBC_RequestPosition(self.serial, self.channel),
-            "SBC_RequestPosition",
-        )
-        time.sleep(0.5)
+        time.sleep(COMMAND_SETTLE_S)
+
+        # Status and position requests are performed automatically by
+        # SBC_StartPolling. Wait for two cycles so both caches are populated
+        # instead of adding duplicate traffic to the controller queue.
+        self._wait_for_polling_updates(cycles=2)
 
     def disconnect(self):
         try:
@@ -336,11 +355,24 @@ class ThorlabsModularStepperController:
     # ------------------------------------------------------------------
     # Status helpers
     # ------------------------------------------------------------------
+    def _wait_for_polling_updates(self, cycles: int = 1):
+        """Wait for background polling to refresh the Kinesis DLL cache."""
+        cycles = max(1, int(cycles))
+        time.sleep(self.get_status_poll_interval_s() * cycles)
+
     def request_update(self):
+        if self._polling:
+            # Kinesis automatically requests status bits and position while
+            # polling. Waiting is both fresher and much lighter on the rack
+            # than queueing the same two requests again.
+            self._wait_for_polling_updates(cycles=2)
+            return
+
         check_zero(
             self.dll.SBC_RequestStatusBits(self.serial, self.channel),
             "SBC_RequestStatusBits",
         )
+        time.sleep(COMMAND_SETTLE_S)
         check_zero(
             self.dll.SBC_RequestPosition(self.serial, self.channel),
             "SBC_RequestPosition",
@@ -354,14 +386,17 @@ class ThorlabsModularStepperController:
         return decode_status(self.get_status_bits())
 
     def request_position(self, settle_delay_s: float | None = None):
+        if settle_delay_s is None:
+            settle_delay_s = self.get_status_poll_interval_s()
+
+        if self._polling:
+            time.sleep(settle_delay_s)
+            return
+
         check_zero(
             self.dll.SBC_RequestPosition(self.serial, self.channel),
             "SBC_RequestPosition",
         )
-
-        if settle_delay_s is None:
-            settle_delay_s = self.get_status_poll_interval_s()
-
         time.sleep(settle_delay_s)
 
     def get_position(self, real_unit: bool = False, refresh: bool = True) -> int:
@@ -381,19 +416,19 @@ class ThorlabsModularStepperController:
         """
         Return True if the controller reports motion/homing.
 
-        Notes:
-        - SBC_GetStatusBits() returns the latest cached status received by the DLL.
-        - So we request a fresh update first, then wait at least one polling interval
-        before reading the bits.
+        SBC_GetStatusBits() returns the DLL's cached status. With background
+        polling active, wait for the next cache update rather than sending a
+        duplicate explicit request. Explicit requests are only used when the
+        controller is not polling.
         """
-        check_zero(
-            self.dll.SBC_RequestStatusBits(self.serial, self.channel),
-            "SBC_RequestStatusBits",
-        )
-
         if settle_delay_s is None:
             settle_delay_s = self.get_status_poll_interval_s()
 
+        if not self._polling:
+            check_zero(
+                self.dll.SBC_RequestStatusBits(self.serial, self.channel),
+                "SBC_RequestStatusBits",
+            )
         time.sleep(settle_delay_s)
 
         status = self.get_status_bits()
@@ -436,6 +471,7 @@ class ThorlabsModularStepperController:
         poll_interval_s: float | None = None,
         require_motion_seen: bool = True,
         motion_start_timeout_s: float = 1.0,
+        start_position_device: int | None = None,
     ):
         """
         Wait until motion has actually finished.
@@ -444,16 +480,23 @@ class ThorlabsModularStepperController:
         - A move command can be issued and the first status read may still say
         'not moving' because the DLL status is cached.
         - So we optionally wait until motion is seen once, then wait for it to clear.
+        - Very short jogs can finish between two status updates. When the
+          pre-command position is supplied, a changed cached position also
+          proves that such a move started and completed.
         """
         if poll_interval_s is None:
             poll_interval_s = self.get_status_poll_interval_s()
 
-        start = time.time()
+        start = time.monotonic()
         deadline = start + timeout_s
         motion_start_deadline = start + motion_start_timeout_s
         saw_motion = False
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             moving = self.is_moving(settle_delay_s=poll_interval_s)
+            position_changed = (
+                start_position_device is not None
+                and self.get_position(refresh=False) != start_position_device
+            )
 
             if moving:
                 saw_motion = True
@@ -461,7 +504,8 @@ class ThorlabsModularStepperController:
                 if (
                     (not require_motion_seen)
                     or saw_motion
-                    or time.time() >= motion_start_deadline
+                    or position_changed
+                    or time.monotonic() >= motion_start_deadline
                 ):
                     return
 
@@ -470,12 +514,23 @@ class ThorlabsModularStepperController:
         )
 
     def wait_until_homed(self, timeout_s: float = 120.0):
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            self.request_update()
-            if self.get_status_bits() & 0x00000400:
+        start = time.monotonic()
+        deadline = start + timeout_s
+        minimum_completion_time = start + ENABLE_SETTLE_S
+        poll_interval_s = self.get_status_poll_interval_s()
+
+        while time.monotonic() < deadline:
+            # Homing can last many seconds. Rely on background polling rather
+            # than filling the device queue with explicit status/position
+            # requests throughout the move.
+            time.sleep(poll_interval_s)
+            status = self.get_status_bits()
+            if (
+                status & 0x00000400
+                and not status & 0x00000200
+                and time.monotonic() >= minimum_completion_time
+            ):
                 return
-            time.sleep(0.3)
         raise TimeoutError("Timed out waiting for homing to complete")
 
     def set_velocity_params(self, acceleration: int, max_velocity: int, real_unit: bool = False):
@@ -500,6 +555,7 @@ class ThorlabsModularStepperController:
                 ),
                 "SBC_SetVelParams",
             )
+        time.sleep(COMMAND_SETTLE_S)
 
     def get_acceleration(self, real_unit: bool = False) -> int:
         if real_unit:
@@ -528,21 +584,37 @@ class ThorlabsModularStepperController:
     # ------------------------------------------------------------------
     # Motion
     # ------------------------------------------------------------------
-    def home(self, wait: bool = True, timeout_s: float = 20.0):
+    def home(self, wait: bool = True, timeout_s: float = 120.0):
         if not self.dll.SBC_CanHome(self.serial, self.channel):
             raise ThorlabsError("This channel cannot home")
 
-        check_zero(
-            self.dll.SBC_Home(self.serial, self.channel),
-            "SBC_Home",
+        # A home request is rejected if a previous move/stop is still being
+        # processed. Confirm an idle cached state and leave a quiet command
+        # gap before issuing SBC_Home.
+        self.wait_until_stopped(
+            timeout_s=min(float(timeout_s), 30.0),
+            require_motion_seen=False,
         )
+        time.sleep(COMMAND_SETTLE_S)
+
+        result = self.dll.SBC_Home(self.serial, self.channel)
+        if result != 0:
+            status = self.get_status_bits()
+            flags = decode_status(status)
+            raise ThorlabsError(
+                f"SBC_Home failed with error code {result}; "
+                f"cached status=0x{status:08X} ({', '.join(flags) or 'no flags'})"
+            )
 
         if wait:
+            time.sleep(MOTION_COMMAND_SETTLE_S)
             self.wait_until_homed(timeout_s=timeout_s)
 
     def move_relative(self, displacement: int, wait: bool = True, timeout_s: float = 30.0, real_unit: bool = False):
         if real_unit:
             displacement = self.unit_real2device(value=displacement,type=0)
+
+        start_position_device = self.get_position(refresh=False)
 
         check_zero(
             self.dll.SBC_MoveRelative(self.serial, self.channel, int(displacement)),
@@ -550,18 +622,24 @@ class ThorlabsModularStepperController:
         )
 
         if wait:
-            self.wait_until_stopped(timeout_s=timeout_s)
+            time.sleep(MOTION_COMMAND_SETTLE_S)
+            self.wait_until_stopped(
+                timeout_s=timeout_s,
+                start_position_device=start_position_device,
+            )
 
     def set_absolute_target(self, position: int):
         check_zero(
             self.dll.SBC_SetMoveAbsolutePosition(self.serial, self.channel, int(position)),
             "SBC_SetMoveAbsolutePosition",
         )
+        time.sleep(COMMAND_SETTLE_S)
 
     def get_absolute_target(self) -> int:
         return int(self.dll.SBC_GetMoveAbsolutePosition(self.serial, self.channel))
 
     def move_absolute(self, position: int, wait: bool = True, timeout_s: float = 30.0, real_unit: bool = False):
+        start_position_device = self.get_position(refresh=False)
         if real_unit:
             self.set_absolute_target(self.unit_real2device(value=position,type=0))
         else:
@@ -573,7 +651,11 @@ class ThorlabsModularStepperController:
         )
 
         if wait:
-            self.wait_until_stopped(timeout_s=timeout_s)
+            time.sleep(MOTION_COMMAND_SETTLE_S)
+            self.wait_until_stopped(
+                timeout_s=timeout_s,
+                start_position_device=start_position_device,
+            )
 
     # ------------------------------------------------------------------
     # Jog
@@ -591,6 +673,7 @@ class ThorlabsModularStepperController:
             ),
             "SBC_SetJogMode",
         )
+        time.sleep(COMMAND_SETTLE_S)
 
     def set_jog_step_size(self, step_size: int, real_unit: bool = False):
         if real_unit:
@@ -599,6 +682,7 @@ class ThorlabsModularStepperController:
             self.dll.SBC_SetJogStepSize(self.serial, self.channel, int(step_size)),
             "SBC_SetJogStepSize",
         )
+        time.sleep(COMMAND_SETTLE_S)
 
     def get_jog_step_size(self, real_unit: bool = False) -> int:
         step_size = int(self.dll.SBC_GetJogStepSize(self.serial, self.channel))
@@ -621,6 +705,7 @@ class ThorlabsModularStepperController:
             ),
             "SBC_SetJogVelParams",
         )
+        time.sleep(COMMAND_SETTLE_S)
 
     def get_jog_velocity_params(self):
         acceleration = c_int()
@@ -640,20 +725,30 @@ class ThorlabsModularStepperController:
         }
 
     def jog_forward(self, wait: bool = True, timeout_s: float = 30.0):
+        start_position_device = self.get_position(refresh=False)
         check_zero(
             self.dll.SBC_MoveJog(self.serial, self.channel, self.DIRECTION_FORWARD),
             "SBC_MoveJog(forward)",
         )
         if wait:
-            self.wait_until_stopped(timeout_s=timeout_s)
+            time.sleep(MOTION_COMMAND_SETTLE_S)
+            self.wait_until_stopped(
+                timeout_s=timeout_s,
+                start_position_device=start_position_device,
+            )
 
     def jog_backward(self, wait: bool = True, timeout_s: float = 30.0):
+        start_position_device = self.get_position(refresh=False)
         check_zero(
             self.dll.SBC_MoveJog(self.serial, self.channel, self.DIRECTION_BACKWARD),
             "SBC_MoveJog(backward)",
         )
         if wait:
-            self.wait_until_stopped(timeout_s=timeout_s)
+            time.sleep(MOTION_COMMAND_SETTLE_S)
+            self.wait_until_stopped(
+                timeout_s=timeout_s,
+                start_position_device=start_position_device,
+            )
 
     # ------------------------------------------------------------------
     # Stop
